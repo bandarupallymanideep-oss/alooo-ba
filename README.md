@@ -1,230 +1,119 @@
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/1e7ceab6-443b-488d-af8f-ed17ec77cce0" alt="Food Ordering Website Logo">
-</p>
+# SADARAKSHAK — Real-Time Road Accident Detection and Monitoring System
 
-<h1 align="center">Nirikshan: Real-Time Road Accident Detection System using YOLOv11 and CCTV Surveillance</h1>
+SADARAKSHAK accepts a CCTV/IP-camera **RTSP stream** or an **uploaded accident video**, runs the trained
+**YOLO11** accident model (`backend/model/best.pt`) on the backend, detects accidents automatically,
+**saves the accident footage** (`backend/detected_accidents/accidentN.mp4`) and shows the live detection
+and the saved footage in the React dashboard.
 
-**Nirikshan** is an AI-powered real-time accident detection system designed to revolutionize road safety. By leveraging advanced computer vision technology, Nirikshan detects vehicle collisions through CCTV footage and instantly notifies highway authorities, enabling swift emergency responses.
-
-## 📝 Table of Contents
-
-1. [Key Features](#key-features)
-2. [Built With](#built-with)
-3. [Getting Started Guide](#getting-started-guide)
-4. [Running the Application](#running-the-application)
-5. [How It Works](#how-it-works)
-6. [System Architecture](#system-architecture)
-7. [Methodology](#methodology)
-8. [Performance Highlights](#performance-highlights-)
-9. [Repository Structure](#repository-structure)
-10. [License](#license)
-11. [Credits & Acknowledgments](#credits--acknowledgments)
-12. [Support & Contact Information](#support--contact-information)
-
-## Key Features ✨
-- **Real-Time Detection:** Powered by YOLO-based object detection for accurate identification of vehicle collisions.
-- **Instant Alerts:** Sends immediate notifications to control centers via WebSocket integration.
-- **Verification Workflow:** Provides an intuitive dashboard for authorities to review and act on detected incidents.
-- **Scalable Design:** Seamlessly integrates with existing CCTV infrastructure for widespread deployment.
-
-## Built With
-
-<p>
-  <img src="https://skillicons.dev/icons?i=nextjs,fastapi,postgres,tailwindcss,prisma,pytorch" alt="Tech Stack" />
-</p>
-
-## 🚀 Getting Started Guide
-
-Follow these steps to set up the project on your local machine.
-
-### 📦 Prerequisites
-
-Ensure you have the following tools installed:
-
-- ✅ **Node.js** (v14 or later)  
-- ✅ **npm** or **yarn**  
-- ✅ **Python** (v3.8 or later)  
-- ⚡ **CUDA Toolkit** (for GPU acceleration, optional)
-
-> 💡 *Tip: Keep your packages up-to-date for best results.*
-
-### 🔧 Installing CUDA
-
-For GPU acceleration, install CUDA on your system.  [Watch Tutorial](https://www.youtube.com/watch?v=nATRPPZ5dGE) for step-by-step guidance.  
-Ensure your CUDA version matches your PyTorch build.
-
-## 🛠️ Installation Steps
-
-### 1. 📁 Clone the Repository
-
-```bash
-git clone https://github.com/VishalRMahajan/Nirikshan.git
-cd Nirikshan
+```
+IP Camera / CCTV ──► RTSP stream ─┐
+                                  ├─► FastAPI backend ─► OpenCV frames ─► YOLO11 ─► accident?
+Uploaded / sample video ──────────┘         │                                        │
+                                            │ annotated MJPEG (live view)            ▼
+                                            ▼                          detected_accidents/accidentN.mp4 (+ .jpg, .json)
+                                   React dashboard  ◄──── /api/accidents ◄───────────┘
+                                   (Live Monitor, Alerts & Violations)
 ```
 
-### 2. ⚙️ Set Up the Frontend
+* **Live view path:** RTSP / video → backend session → annotated **MJPEG** → `<img>` in the browser.
+  Browsers cannot play `rtsp://`, and no FFmpeg / MediaMTX installation is required.
+* **Detection path:** RTSP / video → OpenCV → YOLO11 → accident confirmed → H.264 clip saved → Alerts.
+  YOLO always runs on the server, never in the browser.
 
-Navigate to the frontend folder and install the dependencies:
+## Model
 
-```bash
-cd frontend
+| | |
+|---|---|
+| File | `backend/model/best.pt` (reused as-is) |
+| Architecture | YOLO11m (`yolo11m.yaml`), Ultralytics `detect`, trained at 640 px |
+| Classes | 0 bike, 1 bike_bike_accident, 2 bike_object_accident, 3 bike_person_accident, 4 car, 5 car_bike_accident, 6 car_car_accident, 7 car_object_accident, 8 car_person_accident, 9 person |
+| Accident classes | 1, 2, 3, 5, 6, 7, 8 |
+| Trigger | accident class with confidence ≥ **0.85**, with a car/bike/person in view, in ≥ 2 inferences and ≥ 40 % of inferences within 1.5 s (time-based, independent of inference speed) |
+| Clip | 3 s before the accident → until 3 s after the last detection (max 30 s), boxes drawn |
+
+All values can be overridden with environment variables (see `backend/sadarakshak/constant/application.py`,
+e.g. `SADARAKSHAK_CONFIDENCE_THRESHOLD=0.8`).
+
+## Run
+
+**Backend** (Windows):
+```bat
+cd /d C:\Users\banda\OneDrive\Desktop\SADARAKSHAK\backend
+venv\Scripts\activate
+python -m uvicorn app:app --host 0.0.0.0 --port 8000
+```
+Health check: <http://localhost:8000/health> · API docs: <http://localhost:8000/docs>
+
+**Frontend**:
+```bat
+cd /d C:\Users\banda\OneDrive\Desktop\SADARAKSHAK\frontend
 npm install
-```
-
-### 3. 🔐 Configure Environment Variables (Frontend Only)
-
-1. **Generate Authentication Secret**  
-   Make sure you are in the `frontend` directory before running the following command:
-   ```bash
-   npx auth secret
-   ```
-
-2. **Set Up Google OAuth**
-   - Go to the [Google Cloud Console](https://console.cloud.google.com/).
-   - Create a new project and configure OAuth consent.
-   - Set the Authorized Redirect URI to:
-     ```
-     http://localhost:3000/api/auth/callback/google
-     ```
-
-3. **Create or Update the Following Files in the `frontend` Directory:**
-
-   `.env.local`
-   ```
-   AUTH_SECRET= # Automatically added by `npx auth`
-   AUTH_GOOGLE_ID= # Your Google Client ID
-   AUTH_GOOGLE_SECRET= # Your Google Client Secret
-   ```
-
-   `.env`
-   ```
-   DATABASE_URL= # Your Postgres database connection string
-   ```
-
-4. **Database Setup**  
-   Make sure you are in the `frontend` directory before running the following commands:
-   ```bash
-   cd frontend
-   pnpm exec prisma migrate dev
-   pnpm exec prisma generate
-   ```
-
-### 4. 🔌 Set Up the Backend
-
-1. **Create a Virtual Environment**  
-   ```bash
-   cd ../backend
-   python -m venv venv
-
-   # For Windows:
-   venv\Scripts\activate
-
-   # For macOS/Linux:
-   source venv/bin/activate
-   ```
-
-2. **Install PyTorch in Virtual Environment**  
-   ```bash
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-   ```
-
-3. **Install Backend Dependencies**  
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## ▶️ Running the Application
-
-### 1. 🔙 Start the Backend (FastAPI)
-
-```bash
-cd backend
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
-```
-
-The backend will be available at `http://localhost:8000`.
-
-### 2. 🌐 Start the Frontend (Next.js)
-
-```bash
-cd ../frontend
 npm run dev
 ```
+Open the URL Vite prints (normally <http://localhost:5173>). The backend URL is configured in
+`frontend/.env`: `VITE_BACKEND_URL=http://localhost:8000`.
 
-The frontend will be available at `http://localhost:3000`.
+## Test
 
-## How It Works 🚦
+```bat
+cd backend
+venv\Scripts\activate
+python run_backend_test.py                                   :: model + accident.mp4 + invalid RTSP + API
+python run_backend_test.py --max-frames 900                   :: quicker
+python run_backend_test.py --rtsp rtsp://192.168.1.100:554/stream --rtsp-seconds 30
+python run_backend_test.py --upload C:\path\to\video.mp4        :: needs the backend running
+```
 
-Nirikshan is an AI-powered accident detection system that leverages advanced computer vision technology to identify vehicle collisions in real-time and facilitate rapid emergency response. Here's how it works:
+No camera? Start the built-in RTSP test camera (streams `accident_clips/accident.mp4`, needs nothing extra):
+```bat
+python tools\rtsp_test_server.py                                   :: rtsp://127.0.0.1:8554/stream
+python tools\rtsp_test_server.py --port 8555 --user admin --password test123
+```
 
-### **Step-by-Step Process**
+## Main API
 
-1. **Accident Happens**  
-   A crash occurs on the highway, captured by CCTV cameras installed at strategic locations.
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/health` | status, model, classes, threshold |
+| POST | `/api/cctv/test-connection` | `{rtsp_url}` or `{camera_id}` → step-by-step RTSP diagnosis |
+| GET | `/api/cctv/stream` | raw MJPEG preview (legacy) |
+| GET/POST/PUT/DELETE | `/api/cameras[/{id}]` | camera registry (RTSP passwords never returned) |
+| POST | `/api/cameras/{id}/start` · `/stop` · `/test` | control detection for a camera |
+| POST | `/api/detect/rtsp` | start live detection on a camera or ad-hoc RTSP URL |
+| POST | `/api/detect/video` | upload a video and start detection |
+| POST | `/api/uploads` | upload a video (camera source) |
+| GET | `/api/detect/sessions[/{id}]` | live state: connecting / connected / detecting / accident / reconnecting / disconnected / error / completed |
+| GET | `/api/detect/sessions/{id}/stream` | annotated live MJPEG |
+| GET/PATCH/DELETE | `/api/accidents[/{id}]` | saved accidents; acknowledge / resolve / notes; delete (files moved to `detected_accidents/deleted/`) |
+| GET | `/api/accident-categories` | alert categories and whether the current model supports them |
+| GET | `/detected_accidents/accidentN.mp4` | the saved footage (H.264, range requests) |
+| GET | `/api/accident-clips` · POST `/api/detect/sample-clip` | test videos in `backend/accident_clips` |
 
-2. **CCTV Captures Footage**  
-   The video feed is processed using a YOLO-based vehicle collision detection model to identify accidents with high accuracy.
+RTSP error codes: `INVALID_URL`, `DNS_FAILED`, `CONNECTION_REFUSED`, `TIMEOUT`, `UNREACHABLE`, `NOT_RTSP`,
+`AUTH_REQUIRED`, `AUTH_FAILED`, `STREAM_NOT_FOUND`, `FORBIDDEN`, `UNSUPPORTED_STREAM`, `OPEN_FAILED`,
+`NO_FRAMES`, `STREAM_DISCONNECTED`. Passwords are masked (`rtsp://user:***@host`) in all responses and logs.
 
-3. **Instant Alert Sent**  
-   Upon detecting an accident, the backend system sends an immediate alert to highway authorities via WebSocket integration.
+## Performance & latency
 
-4. **Verification and Response**  
-   Authorities verify the incident through an intuitive dashboard and dispatch emergency services to the scene.
+* **Inference engine** (`SADARAKSHAK_INFERENCE_DEVICE`, default `auto`): CUDA GPU if present, otherwise
+  **OpenVINO** on the Intel iGPU / NPU (an automatic export of the *same* `best.pt` weights to
+  `model/best_openvino_model/`), otherwise PyTorch CPU. On the Core Ultra 5 225H: PyTorch CPU ≈ 107–240 ms,
+  OpenVINO Arc iGPU ≈ 15 ms per frame, with 99.4 % identical accident decisions.
+* **RTSP decoding** uses 1 FFmpeg decoder thread (`SADARAKSHAK_STREAM_DECODER_THREADS`): frame-threading added
+  one frame of delay per thread (≈ 470 ms on 14 cores); 1 thread measured 36 ms.
+* Measured end-to-end (test camera → backend YOLO11 → HTTP client): **median ≈ 54 ms, p90 ≈ 68 ms**.
+  Measure it yourself:
+  ```bat
+  python tools\rtsp_test_server.py --stamp
+  :: start detection on rtsp://127.0.0.1:8554/stream (e.g. camera cam-3), then:
+  python tools\measure_latency.py --session cam-3
+  ```
+* Live tiles show the measured latency (frame decoded → sent to the browser) and YOLO detection latency.
 
-## **System Architecture**
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/1d0be4ae-d18b-4758-893a-3cb333f09d44" alt="Food Ordering Website Logo">
-</p>
+## UI
 
-## Methodology
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/61691468-cf4b-4e6e-9e26-22e4343c7a42" alt="Food Ordering Website Logo">
-</p>
-
-## Performance Highlights 📊
-
-<img src="https://github.com/user-attachments/assets/af36475e-cfa9-45fc-a3b6-1121faf12243" alt="YOLOv11 Performance" style="width:100%; max-width:900px;"/>
-
-### 🔍 Key Performance Metrics
-
-- **mAP@50:** 99% (excellent object detection)
-- **mAP@50-95:** 89.3% (strong performance at stricter thresholds)
-- **Precision:** 96.8% (low false positives)
-- **Recall:** 96.4% (high true positive rate)
-
-### 💡 Class Performance Highlights
-
-- All classes achieve ~99% mAP@50
-- Strongest performance: `car_object_accident` (97.6% mAP@50-95)
-
-## 🗂️ Repository Structure
-
-The project is divided into two main parts:
-
-1. **Frontend** (`/frontend`):  
-   - Built with **Next.js** and **TypeScript**.
-   - Handles the user interface, routing, and authentication.
-   - Includes Prisma for database interaction.
-   - Key files:
-     - `.env.local`: Environment variables for the frontend (Google OAuth, Prisma settings).
-     - `.env`: Additional environment variables for general frontend configuration.
-     - `pages/`: App pages (e.g., `index.tsx`, `login.tsx`).
-     - `components/`: Reusable components.
-     - `prisma/`: Prisma schema and migration files.
-
-2. **Backend** (`/backend`):  
-   - Built with **FastAPI**.
-   - Manages APIs, authentication, and database interaction.
-   - Key files:
-     - `app/`: Core app logic (routes, models, and schemas).
-     - `requirements.txt`: Python dependencies.
-
-## 📄 License  
-This project is licensed under the [MIT License](LICENSE). See the LICENSE file for details.
-
-## 🙌 Credits & Acknowledgments
-Special thanks to [Roboflow](https://universe.roboflow.com/deteccion-h92uo/deteccion_accidentes) for providing the dataset used for training the model. 
-
-## 📬 Support & Contact Information
-For any queries, feedback, or support, feel free to reach out at: **vism06@gmail.com**
-
+* Dark and light themes (switch in the top bar, remembered per browser).
+* Accident videos are reviewed at **0.25x** by default (0.5x / 1x / 1.5x / 2x available).
+* Alerts & Violations: category filter (CAR–CAR, CAR–TRUCK, CAR–PERSON, TRUCK–PERSON + other model classes;
+  truck categories are marked N/A because the current model has no truck class), View / Delete with confirmation.
+* Cameras: Start, Alerts & Violations, Delete Camera (with confirmation) and a ⋮ action menu.

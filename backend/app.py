@@ -1,110 +1,175 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse, StreamingResponse
+"""SADARAKSHAK - Real-Time Road Accident Detection and Monitoring System (FastAPI backend).
+
+Two logically separate but connected paths:
+
+  LIVE VIEW : RTSP / video -> backend session -> annotated MJPEG  (<img src=".../stream">)
+  DETECTION : RTSP / video -> OpenCV -> YOLO11 (model/best.pt) -> accident -> detected_accidents/accidentN.mp4
+              -> /api/accidents -> frontend Alerts
+
+Browsers cannot play rtsp:// directly, and FFmpeg/MediaMTX are not required: the
+backend decodes the stream with OpenCV and serves annotated frames as MJPEG.
+"""
+import asyncio
+import base64
+import json
+import re
+import time
+import traceback
+import uuid
+import logging as _std_logging
+from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
 import cv2
 import numpy as np
-import json
-import asyncio
-import os
-import uuid
-import time
-from datetime import datetime
-from typing import Dict, Set, List, Deque, Optional
-from collections import deque
-import base64
-import traceback
-from Nirikshan.pipeline.training_pipeline import TrainingPipeline
-from Nirikshan.logger import logging
-from pathlib import Path
-import supervision as sv
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-BASE_DIR = Path(__file__).resolve().parent
-ACCIDENT_IMAGES_DIR = BASE_DIR / "accident_images"
-ACCIDENT_IMAGES_DIR.mkdir(exist_ok=True, parents=True)
+from sadarakshak.constant.application import (
+    APP_NAME, APP_DESCRIPTION, BASE_DIR, MODEL_PATH, ACCIDENT_CLIPS_DIR, ACCIDENT_IMAGES_DIR,
+    DETECTED_ACCIDENTS_DIR, UPLOADS_DIR, VIDEO_EXTENSIONS, CONFIDENCE_THRESHOLD, MJPEG_MAX_FPS,
+)
+from sadarakshak.components.accident_detector import ACCIDENT_CLASS_IDS
+from sadarakshak.components.categories import categories_for_model
+from sadarakshak.components.accident_store import accident_store
+from sadarakshak.components.camera_store import camera_store
+from sadarakshak.components.stream_utils import (
+    SourceError, diagnose_source, is_stream_url, mask_url, resolve_file_source, open_capture,
+)
+from sadarakshak.pipeline.detection_session import SessionManager
+from sadarakshak.pipeline.training_pipeline import TrainingPipeline
+from sadarakshak.logger import logging
 
-ACCIDENT_CLIPS_DIR = BASE_DIR / "accident_clips"
-ACCIDENT_CLIPS_DIR.mkdir(exist_ok=True, parents=True)
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 
-UPLOADS_DIR = BASE_DIR / "uploads"
-UPLOADS_DIR.mkdir(exist_ok=True, parents=True)
 
-PUBLIC_IMAGES_DIR = BASE_DIR.parent / "frontend" / "public" / "accident_images"
+# ------------------------------------------------------------------ log hygiene
+class _MaskCredentialsFilter(_std_logging.Filter):
+    """Never let rtsp://user:password@ reach the access log (legacy GET endpoints take URLs in the query)."""
+    _re = re.compile(r"((?:rtsps?|https?|rtmp)(?:%3A|:)(?:%2F|/){2}[^:%/@&?]*(?:%3A|:))[^@&]*?(%40|@)", re.I)
 
-app = FastAPI(title="Nirikshan API", description="Highway CCTV Accident Detection & Monitoring")
-pipeline = TrainingPipeline()
+    def filter(self, record):
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._re.sub(r"\1***\2", a) if isinstance(a, str) else a for a in record.args)
+        return True
+
+
+_std_logging.getLogger("uvicorn.access").addFilter(_MaskCredentialsFilter())
+
+# ------------------------------------------------------------------ model & managers
+pipeline = TrainingPipeline()  # loads model/best.pt once (YOLO11m, 10 classes)
+sessions = SessionManager(model_provider=lambda: pipeline.model_trainer)
+
+
+def _save_thumbnail(camera_id: str):
+    def cb(frame: np.ndarray):
+        cv2.imwrite(str(camera_store.thumbnail_path(camera_id)), frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return cb
+
+
+def _session_status(session_id: str):
+    s = sessions.get(session_id)
+    return s.status() if s else None
+
+
+def _public_camera(cam):
+    return camera_store.public(cam, _session_status(cam["id"]))
+
+
+def _err(code: str, message: str, status: int = 400, **extra):
+    return JSONResponse(status_code=status, content={"success": False, "code": code, "message": message,
+                                                     "detail": message, **extra})
+
+
+def _camera_source(cam) -> str:
+    """Real (unmasked) source for a camera: an RTSP URL or a server-side file path."""
+    src = (cam.get("sourceUrl") or "").strip()
+    if is_stream_url(src):
+        return src
+    return str(resolve_file_source(src))
+
+
+async def _start_camera(cam, test_first: bool = True):
+    try:
+        source = _camera_source(cam)
+    except SourceError as e:
+        return _err(e.code, e.message, e.status_code)
+    if test_first and is_stream_url(source):
+        result, frame = await run_in_threadpool(diagnose_source, source)
+        camera_store.set_fields(cam["id"], lastTest={**result, "testedAt": datetime.utcnow().isoformat() + "Z"})
+        if frame is not None:
+            _save_thumbnail(cam["id"])(frame)
+        if not result["success"]:
+            return _err(result["code"], result["message"], 400, test=result,
+                        camera=_public_camera(camera_store.get(cam["id"])))
+    session = sessions.start(source, camera={k: cam.get(k) for k in ("id", "name", "location", "latitude", "longitude")},
+                             session_id=cam["id"], source_type="rtsp" if is_stream_url(source) else "file",
+                             on_first_frame=_save_thumbnail(cam["id"]))
+    camera_store.set_fields(cam["id"], autoStart=is_stream_url(source))
+    logging.info(f"Detection started for camera {cam['id']} ({mask_url(source) if is_stream_url(source) else Path(source).name})")
+    return {"success": True, "session": session.status(), "camera": _public_camera(camera_store.get(cam["id"]))}
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    accident_store.recover_interrupted()  # clips cut off by a previous crash/restart
+    # resume monitoring of RTSP cameras that were running before a restart (files are not re-processed)
+    for cam in camera_store.list():
+        if cam.get("autoStart") and is_stream_url(cam.get("sourceUrl") or ""):
+            logging.info(f"Resuming detection for camera {cam['id']}")
+            sessions.start(cam["sourceUrl"], camera=cam, session_id=cam["id"], source_type="rtsp",
+                           on_first_frame=_save_thumbnail(cam["id"]))
+    yield
+    sessions.stop_all()
+
+
+app = FastAPI(title=f"{APP_NAME} API", description=APP_DESCRIPTION, lifespan=lifespan)
 
 app.mount("/accident_images", StaticFiles(directory=str(ACCIDENT_IMAGES_DIR)), name="accident_images")
 app.mount("/accident_clips", StaticFiles(directory=str(ACCIDENT_CLIPS_DIR)), name="accident_clips")
+app.mount("/detected_accidents", StaticFiles(directory=str(DETECTED_ACCIDENTS_DIR)), name="detected_accidents")
 
-# Configure CORS for local development and production Vercel frontend
-allowed_origins_env = os.environ.get("ALLOWED_ORIGINS", "")
-allowed_origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:3001",
-    "http://127.0.0.1:3001",
-]
-if allowed_origins_env:
-    for o in allowed_origins_env.split(","):
-        cleaned = o.strip()
-        if cleaned and cleaned not in allowed_origins:
-            allowed_origins.append(cleaned)
-
+# CORS: local Vite dev/preview servers on any port + configured production origins
+allowed_origins = [o.strip() for o in __import__("os").environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origin_regex=r"(https?://(localhost|127\.0\.0\.1)(:\d+)?)|(https://.*\.vercel\.app)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-active_connections: Dict[str, WebSocket] = {}
-detected_accidents: Dict[str, Set[int]] = {}  
-frame_buffers: Dict[str, Deque] = {}
-tracker_instances: Dict[str, sv.ByteTrack] = {}
-traces: Dict[str, Dict[int, deque]] = {}
-cctv_metadata: Dict[str, Dict] = {}
 
-MIN_FRAMES_BETWEEN_DETECTIONS = 30  
-BUFFER_SIZE = 15 
-POST_ACCIDENT_FRAMES = 15 
-ACCIDENT_COOLDOWN_FRAMES = 90
-ACCIDENT_STATE_DURATION = 120
-TRACE_LENGTH = 30
-MAX_TRACE_POINTS = 90
-
-CLASS_NAMES = {
-    0: "bike",
-    1: "bike_bike_accident",
-    2: "bike_object_accident",
-    3: "bike_person_accident",
-    4: "car",
-    5: "car_bike_accident",
-    6: "car_car_accident",
-    7: "car_object_accident",
-    8: "car_person_accident",
-    9: "person"
-}
-
-VEHICLE_CLASS_IDS = [0, 4]
-ACCIDENT_CLASS_IDS = [1, 2, 3, 5, 6, 7, 8]
-
-def format_location(latitude: float, longitude: float) -> str:
-    """Format location coordinates to a readable string"""
-    if latitude is None or longitude is None:
-        return "Unknown location"
-    return f"{latitude:.6f}, {longitude:.6f}"
-
+# ================================================================== health
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    model = pipeline.model_trainer
+    active = [s for s in sessions.list() if s.is_active]
     return {
-        "status": "ok", 
-        "images_dir": str(ACCIDENT_IMAGES_DIR), 
-        "public_dir": str(PUBLIC_IMAGES_DIR)
+        "status": "ok",
+        "app": APP_NAME,
+        "model": {
+            "path": str(MODEL_PATH.relative_to(BASE_DIR)) if MODEL_PATH.is_relative_to(BASE_DIR) else MODEL_PATH.name,
+            "type": "YOLO11m (Ultralytics detect)",
+            "engine": model.engine,
+            "device": str(model.device),
+            "warmupInferenceMs": round(model.warmup_ms, 1),
+            "classes": model.class_names,
+            "accidentClassIds": sorted(ACCIDENT_CLASS_IDS),
+            "confidenceThreshold": CONFIDENCE_THRESHOLD,
+        },
+        "activeSessions": len(active),
+        "accidentsSaved": len(accident_store.list()),
+        "detectedAccidentsDir": str(DETECTED_ACCIDENTS_DIR),
     }
+
 
 @app.get("/images")
 async def list_images():
@@ -114,627 +179,545 @@ async def list_images():
             "filename": file.name,
             "url": f"/accident_images/{file.name}",
             "created": datetime.fromtimestamp(file.stat().st_ctime).isoformat(),
-            "size_bytes": file.stat().st_size
+            "size_bytes": file.stat().st_size,
         })
     return {"images": images, "count": len(images)}
 
-@app.websocket("/ws/detect")
-async def accident_detection_websocket(websocket: WebSocket):
-    await websocket.accept()
-    
-    connection_id = f"conn_{uuid.uuid4().hex[:8]}"
-    active_connections[connection_id] = websocket
-    detected_accidents[connection_id] = set()
-    
-    try:
-        logging.info(f"Client connected: {connection_id}")
-        await websocket.send_json({
-            "message": "Connected to accident detection service",
-            "severity": "info"
-        })
-        
-        await websocket.send_json({
-            "type": "ready",
-            "message": "Backend ready for video processing",
-            "severity": "info"
-        })
-        
-        while True:
-            message = await websocket.receive_text()
-            data = json.loads(message)
-            
-            if data.get("type") == "ping":
-                await websocket.send_json({"type": "pong"})
-            
-            elif data.get("type") == "process_video":
-                video_url = data.get("video_url")
-                
-                cctv_metadata[connection_id] = {
-                    "name": data.get("camera_name", "Unknown Camera"),
-                    "latitude": data.get("latitude"),
-                    "longitude": data.get("longitude"),
-                    "camera_id": data.get("camera_id")
-                }
-                
-                if video_url:
-                    await process_video_stream(websocket, video_url, connection_id)
-    
-    except WebSocketDisconnect:
-        logging.info(f"Client disconnected: {connection_id}")
-    
-    except Exception as e:
-        logging.error(f"Error in WebSocket: {str(e)}")
-        logging.error(traceback.format_exc())
-    
-    finally:
-        if connection_id in active_connections:
-            del active_connections[connection_id]
-        if connection_id in detected_accidents:
-            del detected_accidents[connection_id]
-        if connection_id in traces:
-            del traces[connection_id]
-        if connection_id in tracker_instances:
-            del tracker_instances[connection_id]
-        if connection_id in cctv_metadata:
-            del cctv_metadata[connection_id]
-        logging.info(f"Cleaned up connection: {connection_id}")
 
-def save_accident_image(frame, connection_id: str, frame_number: int) -> Optional[str]:
-    if frame is None:
-        logging.error("No frame provided to save_accident_image")
-        return None
-    
-    try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_id = uuid.uuid4().hex[:8]
-        filename = f"accident_{timestamp}_{unique_id}.jpg"
-        
-        backend_path = ACCIDENT_IMAGES_DIR / filename
-        public_path = PUBLIC_IMAGES_DIR / filename
-        
-        cv2.imwrite(str(backend_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        
-        if not backend_path.exists() or backend_path.stat().st_size == 0:
-            logging.error(f"Failed to create valid image file at {backend_path}")
-            return None
-        
-        try:
-            import shutil
-            if PUBLIC_IMAGES_DIR.parent.exists():
-                PUBLIC_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(backend_path), str(public_path))
-                logging.info(f"Copied image to public directory: {public_path}")
-        except Exception as e:
-            logging.warning(f"Note: Could not copy to public directory: {str(e)}")
+# ================================================================== RTSP connection test
+class ConnectionTestRequest(BaseModel):
+    rtsp_url: Optional[str] = None
+    camera_id: Optional[str] = None
 
-        return f"/accident_images/{filename}"
-        
-    except Exception as e:
-        logging.error(f"Error saving accident image: {str(e)}")
-        logging.error(traceback.format_exc())
-        return None
 
-async def process_video_stream(websocket: WebSocket, video_url: str, connection_id: str):
-    try:
-        frame_buffers[connection_id] = deque(maxlen=BUFFER_SIZE)
-        traces[connection_id] = {}
-        
-        tracker = sv.ByteTrack(
-            track_activation_threshold=0.25,
-            lost_track_buffer=30,
-            minimum_matching_threshold=0.8,
-            frame_rate=24
-        )
-        tracker_instances[connection_id] = tracker
-        
-        frame_count = 0
-        accident_found = False
-        in_accident_sequence = False
-        post_accident_frame_count = 0
-        last_accident_frame = 0
-        in_accident_state = False
-        accident_state_frames = 0
-        detected_accident_type = None
-        detected_confidence = None
-        
-        if video_url.startswith('/accident_clips/'):
-            video_path = str(ACCIDENT_CLIPS_DIR / video_url.replace('/accident_clips/', ''))
-        elif video_url.startswith('/uploads/'):
-            frontend_upload = BASE_DIR.parent / "frontend" / "public" / video_url.lstrip('/')
-            if frontend_upload.exists():
-                video_path = str(frontend_upload)
-            else:
-                video_path = str(UPLOADS_DIR / video_url.split('/')[-1])
-        elif video_url.startswith('/'):
-            frontend_path = BASE_DIR.parent / "frontend" / "public" / video_url.lstrip('/')
-            if frontend_path.exists():
-                video_path = str(frontend_path)
-            else:
-                video_path = str(ACCIDENT_CLIPS_DIR / video_url.split('/')[-1])
-        else:
-            # Check if it's in accident_clips
-            possible_clip = ACCIDENT_CLIPS_DIR / video_url.split('/')[-1]
-            if possible_clip.exists():
-                video_path = str(possible_clip)
-            else:
-                video_path = video_url
-            
-        logging.info(f"Opening video from: {video_path}")
-        cap = cv2.VideoCapture(video_path)
-        
-        if not cap.isOpened():
-            raise Exception(f"Could not open video file: {video_path}")
-            
-        original_fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        target_fps = min(original_fps, 24.0)
-        frame_interval = 1.0 / target_fps
-        
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        scale_factor = 1.0
-        if width > 1280:
-            scale_factor = 1280 / width
-            width = 1280
-            height = int(height * scale_factor)
-        
-        logging.info(f"Video opened: {width}x{height}, Original FPS: {original_fps}, Target FPS: {target_fps}")
-        
-        await websocket.send_json({
-            "type": "video_info",
-            "width": width,
-            "height": height,
-            "fps": target_fps,
-            "original_fps": original_fps,
-            "total_frames": total_frames,
-            "message": f"Processing video at {target_fps} FPS ({width}x{height})",
-            "severity": "info"
-        })
-        
-        processing_time_avg = 0.0
-        frame_times = []
-        last_frame_time = asyncio.get_event_loop().time()
-        
-        box_annotator = sv.BoxAnnotator(thickness=2)
-            
-        while cap.isOpened():
-            batch_start_time = asyncio.get_event_loop().time()
-            
-            ret, frame = cap.read()
-            if not ret:
-                break
-                
-            frame_count += 1
-            
-            if scale_factor < 1.0:
-                frame = cv2.resize(frame, (width, height))
-                
-            frame_buffers[connection_id].append(frame.copy())
-            
-            boxes, class_ids, confidences = pipeline.model_trainer.detect_objects(frame)
+async def _run_connection_test(rtsp_url: Optional[str], camera_id: Optional[str]):
+    source = rtsp_url
+    if camera_id:
+        cam = camera_store.get(camera_id)
+        if not cam:
+            return _err("CAMERA_NOT_FOUND", f"Camera '{camera_id}' not found.", 404)
+        # the stored (real) URL is used unless the user typed a new one
+        if not source or source == mask_url(cam.get("sourceUrl") or ""):
+            source = cam.get("sourceUrl")
+    if not source:
+        return _err("INVALID_URL", "Please enter an RTSP URL, e.g. rtsp://192.168.1.100:554/stream")
+    result, frame = await run_in_threadpool(diagnose_source, source)
+    if camera_id:
+        camera_store.set_fields(camera_id, lastTest={**result, "testedAt": datetime.utcnow().isoformat() + "Z"})
+        if frame is not None:
+            _save_thumbnail(camera_id)(frame)
+    return JSONResponse(status_code=200, content=result)
 
-            if boxes is not None and hasattr(boxes, "shape") and boxes.shape[0] > 0:
-                boxes_np = np.array(boxes, dtype=np.float32)
-                confidences_np = np.array(confidences, dtype=np.float32)
-                class_ids_np = np.array(class_ids, dtype=np.int32)
 
-                detections = sv.Detections(
-                    xyxy=boxes_np,
-                    confidence=confidences_np,
-                    class_id=class_ids_np
-                )
-                tracked_detections = tracker.update_with_detections(detections)
-            else:
-                tracked_detections = sv.Detections.empty()
-            
-            display_frame = frame.copy()
-            
-            accident_indices = []
-            accident_detected = False
-            
-            if len(tracked_detections) > 0:
-                for i in range(len(tracked_detections)):
-                    track_id = tracked_detections.tracker_id[i]
-                    if track_id is None:
-                        continue
-                        
-                    class_id = int(tracked_detections.class_id[i])
-                    confidence = float(tracked_detections.confidence[i])
-                    
-                    is_accident = class_id in ACCIDENT_CLASS_IDS
-                            
-                    if is_accident and confidence >= pipeline.CONFIDENCE_THRESHOLD:
-                        accident_indices.append(i)
-                        accident_detected = True
-                    
-                    if track_id not in traces[connection_id]:
-                        traces[connection_id][track_id] = deque(maxlen=MAX_TRACE_POINTS)
-                    
-                    bbox = tracked_detections.xyxy[i]
-                    center_x = int((bbox[0] + bbox[2]) / 2)
-                    center_y = int((bbox[1] + bbox[3]) / 2)
-                    traces[connection_id][track_id].append((center_x, center_y))
-            
-            labels = []
-            colors = []
-            
-            for i in range(len(tracked_detections)):
-                track_id = tracked_detections.tracker_id[i]
-                if track_id is None:
-                    continue
-                    
-                class_id = int(tracked_detections.class_id[i])
-                conf = float(tracked_detections.confidence[i])
-                
-                class_name = CLASS_NAMES.get(class_id, "Unknown")
-                label = f"{class_name} {track_id}: {conf:.2f}"
-                labels.append(label)
-                
-                is_accident = False
-                for acid in ACCIDENT_CLASS_IDS:
-                    if class_id == acid:
-                        is_accident = True
-                        break
-                        
-                if is_accident:
-                    colors.append((0, 0, 255))
-                elif class_id == 0:
-                    colors.append((0, 165, 255))
-                elif class_id == 4:
-                    colors.append((0, 255, 0))
-                else:
-                    colors.append((255, 255, 255)) 
-            
-            vehicle_mask = []
-            for i in range(len(tracked_detections)):
-                c_id = int(tracked_detections.class_id[i])
-                vehicle_mask.append(c_id == 0 or c_id == 4)
-            non_vehicle_mask = [not vm for vm in vehicle_mask]
+@app.post("/api/cctv/test-connection")
+async def test_cctv_connection_post(body: ConnectionTestRequest):
+    """Test an RTSP URL (or a saved camera) step by step and explain any failure."""
+    return await _run_connection_test(body.rtsp_url, body.camera_id)
 
-            non_vehicle_detections = tracked_detections[non_vehicle_mask]
 
-            if len(non_vehicle_detections) > 0:
-                box_annotator.annotate(
-                    scene=display_frame,
-                    detections=non_vehicle_detections)
-            
-            for track_id, trace_points in traces[connection_id].items():
-                if len(trace_points) < 2:
-                    continue
-                
-                track_class_id = -1
-                for i in range(len(tracked_detections)):
-                    current_track_id = tracked_detections.tracker_id[i]
-                    if current_track_id is not None and int(current_track_id) == int(track_id):
-                        track_class_id = int(tracked_detections.class_id[i])
-                        break
-                
-                if track_class_id == 0 or track_class_id == 4:
-                    color = (0, 165, 255) if track_class_id == 0 else (0, 255, 0)
-                    points = np.array(list(trace_points), dtype=np.int32)
-                    cv2.polylines(display_frame, [points], False, color, 3)
-                    
-                    if len(trace_points) >= 1:
-                        end_pt = trace_points[-1]
-                        cv2.circle(display_frame, end_pt, 5, color, -1)
-                
-                else:
-                    is_accident = False
-                    for acid in ACCIDENT_CLASS_IDS:
-                        if track_class_id == acid:
-                            is_accident = True
-                            break
-                            
-                    if is_accident:
-                        color = (0, 0, 255)
-                        points = np.array(list(trace_points), dtype=np.int32)
-                        cv2.polylines(display_frame, [points], False, color, 3)
-                        
-                        if len(trace_points) >= 1:
-                            end_pt = trace_points[-1]
-                            cv2.circle(display_frame, end_pt, 6, color, -1)
-                    
-            if accident_detected and not in_accident_state:
-                last_accident_frame = frame_count
-                in_accident_state = True
-                accident_state_frames = 0
-                accident_found = True
-                in_accident_sequence = True
-                post_accident_frame_count = 0
-                
-                if accident_indices:
-                    i = accident_indices[0]
-                    confidence = float(tracked_detections.confidence[i])
-                    class_id = int(tracked_detections.class_id[i])
-                    class_name = CLASS_NAMES.get(class_id, "Unknown")
-                    
-                    detected_accident_type = class_name
-                    detected_confidence = confidence
-                    
-                    location = "Unknown location"
-                    if connection_id in cctv_metadata:
-                        meta = cctv_metadata[connection_id]
-                        if meta.get("latitude") is not None and meta.get("longitude") is not None:
-                            location = format_location(meta["latitude"], meta["longitude"])
-                    
-                    await websocket.send_json({
-                        "type": "accident",
-                        "accident_detected": True,
-                        "frame_number": frame_count,
-                        "confidence": confidence,
-                        "accident_type": class_name,
-                        "location": location,
-                        "message": f"{class_name} detected at frame {frame_count}",
-                        "severity": "error",
-                        "timestamp": datetime.now().timestamp()
-                    })
-                    
-                    image_url = save_accident_image(display_frame, connection_id, frame_count)
-                    
-                    if image_url:
-                        await websocket.send_json({
-                            "type": "image_saved",
-                            "message": f"Accident image saved: {image_url}",
-                            "severity": "info",
-                            "image_url": image_url,
-                            "frame_number": frame_count,
-                            "accident_type": class_name,
-                            "confidence": confidence,
-                            "location": location,
-                            "timestamp": datetime.now().timestamp()
-                        })
-            
-            if in_accident_state:
-                accident_state_frames += 1
-                if accident_state_frames >= ACCIDENT_STATE_DURATION:
-                    in_accident_state = False
-            
-            _, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            encoded_frame = base64.b64encode(buffer).decode('utf-8')
-            
-            await websocket.send_json({
-                "type": "frame",
-                "frame": encoded_frame,
-                "frame_number": frame_count,
-                "timestamp": datetime.now().timestamp(),
-                "display_time": frame_count / original_fps,
-                "total_frames": total_frames,
-                "progress": frame_count / total_frames if total_frames > 0 else 0
-            })
-        
-            if frame_count % 30 == 0:
-                await websocket.send_json({
-                    "type": "progress",
-                    "message": f"Processed {frame_count} of {total_frames} frames",
-                    "severity": "info",
-                    "frame_count": frame_count,
-                    "progress": frame_count / total_frames if total_frames > 0 else 0
-                })
-            
-            current_time = asyncio.get_event_loop().time()
-            processing_time = current_time - batch_start_time
-            frame_times.append(processing_time)
-            
-            if len(frame_times) > 10:
-                frame_times.pop(0)
-            processing_time_avg = sum(frame_times) / len(frame_times)
-            
-            elapsed = current_time - last_frame_time
-            sleep_time = max(0, frame_interval - elapsed)
-            
-            await asyncio.sleep(sleep_time)
-            last_frame_time = asyncio.get_event_loop().time()
+@app.get("/api/cctv/test-connection")
+async def test_cctv_connection(rtsp_url: str = "", camera_id: Optional[str] = None):
+    """Legacy GET variant (prefer POST: credentials in a query string can end up in proxy logs)."""
+    return await _run_connection_test(rtsp_url, camera_id)
 
-        cap.release()
-        
-        location = "Unknown location"
-        meta = cctv_metadata.get(connection_id, {})
-        if meta.get("latitude") is not None and meta.get("longitude") is not None:
-            location = format_location(meta["latitude"], meta["longitude"])
-        
-        await websocket.send_json({
-            "type": "processing_complete",
-            "message": "Video processing completed",
-            "severity": "info",
-            "accident_found": accident_found,
-            "total_frames": frame_count,
-            "location": location,
-            "timestamp": datetime.now().timestamp()
-        })
-            
-    except Exception as e:
-        logging.error(f"Error processing video: {str(e)}")
-        logging.error(traceback.format_exc())
-        await websocket.send_json({
-            "type": "error",
-            "message": f"Error processing video: {str(e)}",
-            "severity": "error"
-        })
 
-def base64_to_image(base64_string):
-    if "base64," in base64_string:
-        base64_string = base64_string.split("base64,")[1]
-    imgdata = base64.b64decode(base64_string)
-    nparr = np.frombuffer(imgdata, np.uint8)
-    return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-@app.post("/detect/image")
-async def detect_image(file: UploadFile = File(...)):
-    contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    result = pipeline.process_frame(img)
-    return JSONResponse(content={
-        "status": "success",
-        "result": result,
-        "accident_detected": (result == "Accident detected")
-    })
-
-@app.post("/detect/video")
-async def detect_video(file: UploadFile = File(...)):
-    contents = await file.read()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    video_path = UPLOADS_DIR / f"videoUpload_{timestamp}_{file.filename}"
-    
-    with open(video_path, "wb") as f:
-        f.write(contents)
-    
-    pipeline.reset_state()
-    result = pipeline.process_video(str(video_path))
-    accident_detected = (result == "Accident detected")
-    return JSONResponse(content={
-        "status": "success",
-        "result": result,
-        "accident_detected": accident_detected,
-        "filename": file.filename,
-        "message": f"Video analysis complete: {result}"
-    })
-
-# =========================================================================
-# RTSP LIVE VIDEO STREAMING & CONNECTION VERIFICATION
-# =========================================================================
-
-def generate_mjpeg_stream(rtsp_url: str):
-    """
-    Generate a continuous MJPEG multipart stream from an RTSP camera URL
-    or local video clip. This enables standard browser playback via <img> tag.
-    """
-    video_source = rtsp_url
-    if not rtsp_url.startswith("rtsp://") and not rtsp_url.startswith("http://"):
-        possible_clip = ACCIDENT_CLIPS_DIR / rtsp_url.split("/")[-1]
-        if possible_clip.exists():
-            video_source = str(possible_clip)
-
-    cap = cv2.VideoCapture(video_source)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
+def generate_mjpeg_stream(source: str):
+    """Raw (non-annotated) MJPEG preview of an RTSP URL or local clip."""
+    cap = open_capture(source)
     if not cap.isOpened():
-        logging.error(f"Cannot open video source for streaming: {video_source}")
+        logging.error(f"Cannot open video source for streaming: {mask_url(source)}")
         return
-
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                # If reading a file, loop back to the beginning so it streams continuously
-                if not rtsp_url.startswith("rtsp://"):
+                if not is_stream_url(source):  # loop local files
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     ret, frame = cap.read()
-                    if not ret:
-                        break
-                else:
+                if not ret:
                     break
-
             h, w = frame.shape[:2]
             if w > 1280:
                 frame = cv2.resize(frame, (1280, int(h * 1280 / w)))
-
-            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            if not ret:
-                continue
-
-            frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            time.sleep(0.04)  # ~25 fps cap to prevent saturation
+            ok, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            if ok:
+                yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n'
+            time.sleep(0.04)
     except Exception as e:
-        logging.error(f"Error in MJPEG stream: {str(e)}")
+        logging.error(f"Error in MJPEG stream: {e}")
     finally:
         cap.release()
 
+
 @app.get("/api/cctv/stream")
-async def stream_cctv(rtsp_url: str):
-    """
-    Stream live CCTV footage as browser-compatible MJPEG multipart stream.
-    Usable in browser directly via: <img src="/api/cctv/stream?rtsp_url=..." />
-    """
-    if not rtsp_url:
-        raise HTTPException(status_code=400, detail="rtsp_url query parameter is required")
-    return StreamingResponse(
-        generate_mjpeg_stream(rtsp_url),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
+async def stream_cctv(rtsp_url: str = "", camera_id: Optional[str] = None):
+    """Raw MJPEG preview: <img src="/api/cctv/stream?camera_id=cam-1" />."""
+    source = rtsp_url
+    if camera_id:
+        cam = camera_store.get(camera_id)
+        if not cam:
+            return _err("CAMERA_NOT_FOUND", f"Camera '{camera_id}' not found.", 404)
+        source = cam.get("sourceUrl")
+    if not source:
+        return _err("INVALID_URL", "rtsp_url or camera_id is required")
+    if not is_stream_url(source):
+        try:
+            source = str(resolve_file_source(source))
+        except SourceError as e:
+            return _err(e.code, e.message, e.status_code)
+    return StreamingResponse(generate_mjpeg_stream(source), media_type="multipart/x-mixed-replace; boundary=frame")
 
-@app.get("/api/cctv/test-connection")
-async def test_cctv_connection(rtsp_url: str):
-    """
-    Test RTSP camera connectivity and return stream health / metadata.
-    Used by CCTV Settings to verify camera connections before or after saving.
-    """
-    if not rtsp_url:
-        return JSONResponse(status_code=400, content={"success": False, "message": "rtsp_url parameter required"})
-    
-    video_source = rtsp_url
-    if not rtsp_url.startswith("rtsp://") and not rtsp_url.startswith("http://"):
-        possible_clip = ACCIDENT_CLIPS_DIR / rtsp_url.split("/")[-1]
-        if possible_clip.exists():
-            video_source = str(possible_clip)
 
-    cap = cv2.VideoCapture(video_source)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+# ================================================================== cameras
+class CameraBody(BaseModel):
+    name: Optional[str] = None
+    location: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    sourceType: Optional[str] = None
+    sourceUrl: Optional[str] = None
+    fileName: Optional[str] = None
+    startDetection: Optional[bool] = None
 
-    if not cap.isOpened():
-        return JSONResponse(content={
-            "success": False,
-            "status": "offline",
-            "message": "Unable to connect to camera or RTSP stream"
-        })
 
-    ret, frame = cap.read()
-    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    cap.release()
+def _validate_camera_source(source_type: Optional[str], source_url: Optional[str]):
+    if not source_url:
+        raise SourceError("INVALID_URL", "A camera needs an RTSP URL or a video file.")
+    if source_type == "rtsp" or "://" in source_url:
+        from sadarakshak.components.stream_utils import validate_stream_url
+        validate_stream_url(source_url)
+    else:
+        resolve_file_source(source_url)
 
-    if not ret or frame is None:
-        return JSONResponse(content={
-            "success": False,
-            "status": "offline",
-            "message": "Connected but failed to receive video frames from stream"
-        })
 
-    h, w = frame.shape[:2]
-    return JSONResponse(content={
-        "success": True,
-        "status": "online",
-        "message": "Camera stream connected successfully",
-        "resolution": f"{w}x{h}",
-        "fps": round(fps, 1)
-    })
+@app.get("/api/cameras")
+async def list_cameras():
+    return {"cameras": [_public_camera(c) for c in camera_store.list()]}
 
-# =========================================================================
-# SAMPLE ACCIDENT CLIPS FOR TESTING & ANALYZE
-# =========================================================================
 
+@app.post("/api/cameras")
+async def create_camera(body: CameraBody):
+    data = body.model_dump(exclude_none=True)
+    if not (data.get("name") or "").strip():
+        return _err("INVALID_NAME", "Camera name is required.")
+    try:
+        _validate_camera_source(data.get("sourceType"), data.get("sourceUrl"))
+    except SourceError as e:
+        return _err(e.code, e.message, e.status_code)
+    data["sourceType"] = "rtsp" if is_stream_url(data["sourceUrl"]) else "upload"
+    cam = camera_store.create(data)
+    logging.info(f"Camera created {cam['id']} ({mask_url(cam['sourceUrl'])})")
+    if body.startDetection:
+        res = await _start_camera(cam)
+        if isinstance(res, JSONResponse):  # saved, but detection could not start: report both
+            payload = json.loads(res.body)
+            payload["camera"] = _public_camera(camera_store.get(cam["id"]))
+            payload["saved"] = True
+            return JSONResponse(status_code=200, content=payload)
+        return {"success": True, "camera": res["camera"], "session": res["session"]}
+    return {"success": True, "camera": _public_camera(cam)}
+
+
+@app.put("/api/cameras/{camera_id}")
+async def update_camera(camera_id: str, body: CameraBody):
+    cam = camera_store.get(camera_id)
+    if not cam:
+        return _err("CAMERA_NOT_FOUND", f"Camera '{camera_id}' not found.", 404)
+    data = body.model_dump(exclude_none=True)
+    new_src = data.get("sourceUrl")
+    if new_src and new_src != mask_url(cam.get("sourceUrl") or ""):
+        try:
+            _validate_camera_source(data.get("sourceType"), new_src)
+        except SourceError as e:
+            return _err(e.code, e.message, e.status_code)
+        data["sourceType"] = "rtsp" if is_stream_url(new_src) else "upload"
+    source_changed = bool(new_src and new_src != mask_url(cam.get("sourceUrl") or ""))
+    cam = camera_store.update(camera_id, data)
+    if source_changed:
+        camera_store.set_fields(camera_id, lastTest=None)
+        sessions.remove(camera_id)
+    if body.startDetection is True and not (sessions.get(camera_id) and sessions.get(camera_id).is_active):
+        res = await _start_camera(camera_store.get(camera_id))
+        if isinstance(res, JSONResponse):
+            payload = json.loads(res.body)
+            payload["camera"] = _public_camera(camera_store.get(camera_id))
+            payload["saved"] = True
+            return JSONResponse(status_code=200, content=payload)
+    elif body.startDetection is False:
+        sessions.stop(camera_id)
+        camera_store.set_fields(camera_id, autoStart=False)
+    return {"success": True, "camera": _public_camera(camera_store.get(camera_id))}
+
+
+@app.delete("/api/cameras/{camera_id}")
+async def delete_camera(camera_id: str):
+    sessions.remove(camera_id)
+    if not camera_store.delete(camera_id):
+        return _err("CAMERA_NOT_FOUND", f"Camera '{camera_id}' not found.", 404)
+    return {"success": True}
+
+
+@app.post("/api/cameras/{camera_id}/test")
+async def test_camera(camera_id: str):
+    return await _run_connection_test(None, camera_id)
+
+
+@app.post("/api/cameras/{camera_id}/start")
+async def start_camera(camera_id: str):
+    cam = camera_store.get(camera_id)
+    if not cam:
+        return _err("CAMERA_NOT_FOUND", f"Camera '{camera_id}' not found.", 404)
+    return await _start_camera(cam)
+
+
+@app.post("/api/cameras/{camera_id}/stop")
+async def stop_camera(camera_id: str):
+    if not camera_store.get(camera_id):
+        return _err("CAMERA_NOT_FOUND", f"Camera '{camera_id}' not found.", 404)
+    sessions.stop(camera_id)
+    camera_store.set_fields(camera_id, autoStart=False)
+    return {"success": True, "camera": _public_camera(camera_store.get(camera_id))}
+
+
+@app.get("/api/cameras/{camera_id}/thumbnail")
+async def camera_thumbnail(camera_id: str):
+    path = camera_store.thumbnail_path(camera_id)
+    if not re.fullmatch(r"[\w-]+", camera_id) or not path.exists():
+        raise HTTPException(status_code=404, detail="No thumbnail yet")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+# ================================================================== uploads
+async def _save_upload(file: UploadFile) -> Path:
+    name = Path(file.filename or "video.mp4").name
+    ext = Path(name).suffix.lower()
+    if ext not in VIDEO_EXTENSIONS:
+        raise SourceError("UNSUPPORTED_FILE", f"Unsupported file type '{ext or '?'}'. Allowed: {', '.join(sorted(VIDEO_EXTENSIONS))}")
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(name).stem)[:60] or "video"
+    dest = UPLOADS_DIR / f"upload_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}_{safe}{ext}"
+    size = 0
+    with open(dest, "wb") as f:
+        while chunk := await file.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                f.close()
+                dest.unlink(missing_ok=True)
+                raise SourceError("FILE_TOO_LARGE", "Video is larger than the 500 MB limit.", 413)
+            f.write(chunk)
+    if size == 0:
+        dest.unlink(missing_ok=True)
+        raise SourceError("EMPTY_FILE", "The uploaded file is empty.")
+    result, _ = await run_in_threadpool(diagnose_source, str(dest), True)
+    if not result["success"]:
+        dest.unlink(missing_ok=True)
+        raise SourceError(result["code"], result["message"])
+    return dest
+
+
+@app.post("/api/uploads")
+async def upload_video(file: UploadFile = File(...)):
+    """Store a user video in backend/uploads and return its server path (used as a camera source)."""
+    try:
+        dest = await _save_upload(file)
+    except SourceError as e:
+        return _err(e.code, e.message, e.status_code)
+    return {"success": True, "filename": dest.name, "originalName": file.filename,
+            "url": f"/uploads/{dest.name}", "sizeBytes": dest.stat().st_size}
+
+
+# ================================================================== detection sessions
+class RtspDetectRequest(BaseModel):
+    rtsp_url: Optional[str] = None
+    camera_id: Optional[str] = None
+    camera_name: Optional[str] = None
+    location: Optional[str] = None
+
+
+@app.post("/api/detect/rtsp")
+async def detect_rtsp(body: RtspDetectRequest):
+    """Start live detection on a saved camera (camera_id) or an ad-hoc RTSP URL."""
+    if body.camera_id:
+        cam = camera_store.get(body.camera_id)
+        if not cam:
+            return _err("CAMERA_NOT_FOUND", f"Camera '{body.camera_id}' not found.", 404)
+        return await _start_camera(cam)
+    result, _ = await run_in_threadpool(diagnose_source, body.rtsp_url or "")
+    if not result["success"]:
+        return _err(result["code"], result["message"], 400, test=result)
+    if not is_stream_url(body.rtsp_url):
+        return _err("INVALID_URL", "Use /api/detect/video or /api/detect/sample-clip for video files.")
+    sid = f"rtsp-{uuid.uuid4().hex[:8]}"
+    session = sessions.start(body.rtsp_url, session_id=sid, source_type="rtsp", camera={
+        "id": sid, "name": body.camera_name or f"RTSP {mask_url(body.rtsp_url)}", "location": body.location or "Unknown location"})
+    return {"success": True, "test": result, "session": session.status()}
+
+
+@app.post("/api/detect/video")
+async def detect_video_upload(file: UploadFile = File(...), camera_name: str = Form(""), location: str = Form("")):
+    """Upload a video and start background detection on it (watch it via the session stream)."""
+    try:
+        dest = await _save_upload(file)
+    except SourceError as e:
+        return _err(e.code, e.message, e.status_code)
+    sid = f"video-{uuid.uuid4().hex[:8]}"
+    session = sessions.start(str(dest), session_id=sid, source_type="file", camera={
+        "id": sid, "name": camera_name or f"Upload: {file.filename}", "location": location or "Uploaded video"})
+    return {"success": True, "upload": {"filename": dest.name, "url": f"/uploads/{dest.name}"}, "session": session.status()}
+
+
+@app.get("/api/detect/sessions")
+async def list_sessions():
+    return {"sessions": [s.status() for s in sessions.list()]}
+
+
+@app.get("/api/detect/sessions/{session_id}")
+async def get_session(session_id: str):
+    st = _session_status(session_id)
+    if st is None:
+        return _err("SESSION_NOT_FOUND", f"No detection session '{session_id}'.", 404)
+    return st
+
+
+@app.post("/api/detect/sessions/{session_id}/stop")
+async def stop_session(session_id: str):
+    s = sessions.stop(session_id)
+    if s is None:
+        return _err("SESSION_NOT_FOUND", f"No detection session '{session_id}'.", 404)
+    if camera_store.get(session_id):
+        camera_store.set_fields(session_id, autoStart=False)
+    return {"success": True, "session": s.status()}
+
+
+@app.get("/api/detect/sessions/{session_id}/stream")
+async def session_stream(session_id: str, request: Request, overlay: bool = True):
+    """Live annotated MJPEG of a detection session (overlay=false -> raw frames)."""
+    if sessions.get(session_id) is None:
+        return _err("SESSION_NOT_FOUND", f"No detection session '{session_id}'.", 404)
+
+    async def gen():
+        # Push each new frame as soon as it is ready (checked every 5 ms) instead of a fixed
+        # poll interval, capped at MJPEG_MAX_FPS - keeps display latency low.
+        last_seq, last_sent, min_gap = -1, 0.0, 1.0 / MJPEG_MAX_FPS
+        checks = 0
+        while True:
+            checks += 1
+            if checks % 40 == 0 and await request.is_disconnected():
+                break
+            s = sessions.get(session_id)
+            if s is None:
+                break
+            if s.frame_seq != last_seq and time.time() - last_sent >= min_gap:
+                jpeg, seq, captured_at = (s.get_jpeg(True) if overlay
+                                          else await run_in_threadpool(s.get_jpeg, False))
+                if jpeg:
+                    last_seq, last_sent = seq, time.time()
+                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+                    s.note_delivery(captured_at)
+                    continue
+            elif not s.is_active and s.frame_seq == last_seq:
+                break  # session over: the browser keeps showing the last frame
+            await asyncio.sleep(0.005)
+
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame",
+                             headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/detect/sessions/{session_id}/snapshot")
+async def session_snapshot(session_id: str, overlay: bool = True):
+    s = sessions.get(session_id)
+    jpeg = s.get_jpeg(overlay)[0] if s else None
+    if not jpeg:
+        raise HTTPException(status_code=404, detail="No frame available")
+    return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+# ================================================================== accidents (generated files)
+class AccidentUpdate(BaseModel):
+    status: Optional[str] = None
+    notes: Optional[str] = None
+    operatorName: Optional[str] = None
+
+
+@app.get("/api/accidents")
+async def list_accidents(camera_id: Optional[str] = None):
+    records = accident_store.list()
+    if camera_id:
+        records = [r for r in records if r.get("cameraId") == camera_id]
+    return {"accidents": records, "count": len(records)}
+
+
+@app.get("/api/accidents/{accident_id}")
+async def get_accident(accident_id: str):
+    rec = accident_store.get(accident_id)
+    if rec is None:
+        return _err("ACCIDENT_NOT_FOUND", f"Accident '{accident_id}' not found.", 404)
+    return rec
+
+
+@app.get("/api/accident-categories")
+async def accident_categories():
+    """Alert categories and whether the current YOLO model can detect them."""
+    return {"categories": categories_for_model(pipeline.model_trainer.class_names.values())}
+
+
+@app.delete("/api/accidents/{accident_id}")
+async def delete_accident(accident_id: str):
+    """Delete an accident alert (its video/snapshot/metadata are moved to detected_accidents/deleted/)."""
+    try:
+        ok = accident_store.delete(accident_id)
+    except RuntimeError as e:
+        return _err("ACCIDENT_RECORDING", str(e), 409)
+    if not ok:
+        return _err("ACCIDENT_NOT_FOUND", f"Accident '{accident_id}' not found.", 404)
+    return {"success": True, "id": accident_id}
+
+
+@app.patch("/api/accidents/{accident_id}")
+async def update_accident(accident_id: str, body: AccidentUpdate):
+    try:
+        rec = accident_store.update(accident_id, status=body.status, notes=body.notes, operator=body.operatorName)
+    except ValueError as e:
+        return _err("INVALID_STATUS", str(e))
+    if rec is None:
+        return _err("ACCIDENT_NOT_FOUND", f"Accident '{accident_id}' not found.", 404)
+    return rec
+
+
+# ================================================================== sample clips (backend/accident_clips)
 @app.get("/api/accident-clips")
 async def list_accident_clips():
-    """List available sample accident clips in backend/accident_clips"""
+    """List the original test videos in backend/accident_clips (never modified)."""
     clips = []
-    if ACCIDENT_CLIPS_DIR.exists():
-        for file in sorted(ACCIDENT_CLIPS_DIR.glob("*.mp4")):
+    for file in sorted(ACCIDENT_CLIPS_DIR.iterdir()):
+        if file.suffix.lower() in VIDEO_EXTENSIONS:
             clips.append({
                 "filename": file.name,
                 "size_bytes": file.stat().st_size,
                 "size_mb": round(file.stat().st_size / (1024 * 1024), 2),
-                "url": f"/accident_clips/{file.name}"
+                "url": f"/accident_clips/{file.name}",
             })
     return {"clips": clips, "count": len(clips)}
 
+
 @app.post("/api/detect/sample-clip")
-async def detect_sample_clip(filename: str = Form(...)):
-    """Run accident detection directly on a sample clip from backend/accident_clips"""
-    clip_path = ACCIDENT_CLIPS_DIR / filename
-    if not clip_path.exists():
-        raise HTTPException(status_code=404, detail=f"Clip not found: {filename}")
-    
-    pipeline.reset_state()
-    result = pipeline.process_video(str(clip_path))
-    accident_detected = (result == "Accident detected")
+async def detect_sample_clip(filename: str = Form(...), background: bool = Form(False),
+                             detect_every: int = Form(2)):
+    """Run detection on a clip from backend/accident_clips.
+
+    background=false (default, original behaviour): process the whole clip and return the result.
+    background=true: start a live session and return immediately (watch via its stream URL).
+    """
+    try:
+        clip_path = resolve_file_source(f"/accident_clips/{Path(filename).name}")
+    except SourceError as e:
+        return _err(e.code, e.message, e.status_code)
+    camera = {"id": f"clip-{clip_path.stem}", "name": f"Sample Clip - {clip_path.name}", "location": "Test footage"}
+    if background:
+        session = sessions.start(str(clip_path), camera=camera, session_id=camera["id"], source_type="file")
+        return {"success": True, "session": session.status()}
+    res = await run_in_threadpool(pipeline.process_video, str(clip_path), None, False, camera, detect_every)
     return JSONResponse(content={
-        "status": "success",
-        "result": result,
-        "accident_detected": accident_detected,
-        "filename": filename,
-        "message": f"Analysis complete: {result}"
-    })
+        "status": "success", "result": res["result"], "accident_detected": res["accident_detected"],
+        "filename": clip_path.name, "output_video": res["output_video"],
+        "accidents": res["accidents"], "details": {k: v for k, v in res.items() if k != "accidents"},
+        "message": f"Analysis complete: {res['result']} ({len(res['accidents'])} accident clip(s) saved)",
+    })
+
+
+# ================================================================== legacy endpoints
+@app.post("/detect/image")
+async def detect_image(file: UploadFile = File(...)):
+    contents = await file.read()
+    img = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return _err("INVALID_IMAGE", "Could not decode the uploaded image.")
+    result = await run_in_threadpool(pipeline.process_frame, img)
+    return JSONResponse(content={"status": "success", "result": result,
+                                 "accident_detected": result == "Accident detected"})
+
+
+@app.post("/detect/video")
+async def detect_video(file: UploadFile = File(...), detect_every: int = Form(2)):
+    """Legacy synchronous analysis of an uploaded video (use /api/detect/video for live progress)."""
+    try:
+        dest = await _save_upload(file)
+    except SourceError as e:
+        return _err(e.code, e.message, e.status_code)
+    camera = {"id": "upload", "name": f"Upload: {file.filename}", "location": "Uploaded video"}
+    res = await run_in_threadpool(pipeline.process_video, str(dest), None, False, camera, detect_every)
+    return JSONResponse(content={
+        "status": "success", "result": res["result"], "accident_detected": res["accident_detected"],
+        "filename": file.filename, "output_video": res["output_video"], "accidents": res["accidents"],
+        "details": {k: v for k, v in res.items() if k != "accidents"},
+        "message": f"Video analysis complete: {res['result']}",
+    })
+
+
+@app.websocket("/ws/detect")
+async def accident_detection_websocket(websocket: WebSocket):
+    """Legacy WebSocket API, now backed by the shared detection session engine."""
+    await websocket.accept()
+    connection_id = f"ws-{uuid.uuid4().hex[:8]}"
+    await websocket.send_json({"message": "Connected to accident detection service", "severity": "info"})
+    await websocket.send_json({"type": "ready", "message": "Backend ready for video processing", "severity": "info"})
+    try:
+        while True:
+            data = json.loads(await websocket.receive_text())
+            if data.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
+            if data.get("type") != "process_video" or not data.get("video_url"):
+                continue
+            source = data["video_url"]
+            if not is_stream_url(source):
+                try:
+                    source = str(resolve_file_source(source))
+                except SourceError as e:
+                    await websocket.send_json({"type": "error", "message": e.message, "severity": "error"})
+                    continue
+            camera = {"id": data.get("camera_id") or connection_id, "name": data.get("camera_name", "Unknown Camera"),
+                      "latitude": data.get("latitude"), "longitude": data.get("longitude")}
+            s = sessions.start(source, camera=camera, session_id=connection_id)
+            last_seq, sent_info, sent_ids = -1, False, set()
+            while True:
+                st = s.status()
+                if not sent_info and st["resolution"]:
+                    w, h = map(int, st["resolution"].split("x"))
+                    sent_info = True
+                    await websocket.send_json({"type": "video_info", "width": w, "height": h, "fps": st["sourceFps"],
+                                               "total_frames": st["totalFrames"], "severity": "info",
+                                               "message": f"Processing video ({st['resolution']})"})
+                jpeg, seq, _ = s.get_jpeg(True)
+                if jpeg and seq != last_seq:
+                    last_seq = seq
+                    await websocket.send_json({"type": "frame", "frame": base64.b64encode(jpeg).decode(),
+                                               "frame_number": st["framesProcessed"], "progress": st["progress"] or 0,
+                                               "timestamp": time.time()})
+                for aid in st["accidentIds"]:
+                    if aid not in sent_ids:
+                        sent_ids.add(aid)
+                        rec = accident_store.get(aid) or {}
+                        await websocket.send_json({"type": "accident", "accident_detected": True, "accident_id": aid,
+                                                   "accident_type": rec.get("accidentType"),
+                                                   "confidence": rec.get("confidence"), "severity": "error",
+                                                   "message": f"{rec.get('accidentType')} detected ({aid})",
+                                                   "timestamp": time.time()})
+                        await websocket.send_json({"type": "image_saved", "image_url": rec.get("snapshotUrl"),
+                                                   "video_url": rec.get("videoClipUrl"), "severity": "info",
+                                                   "message": f"Accident footage saved: {rec.get('clipFile')}"})
+                if not s.is_active:
+                    if st["state"] == "error":
+                        await websocket.send_json({"type": "error", "severity": "error",
+                                                   "message": (st["error"] or {}).get("message", "Processing failed")})
+                    await websocket.send_json({"type": "processing_complete", "message": "Video processing completed",
+                                               "severity": "info", "accident_found": bool(st["accidentIds"]),
+                                               "accidents": st["accidentIds"], "total_frames": st["framesProcessed"],
+                                               "timestamp": time.time()})
+                    break
+                await asyncio.sleep(1.0 / MJPEG_MAX_FPS)
+    except WebSocketDisconnect:
+        logging.info(f"Client disconnected: {connection_id}")
+    except Exception as e:
+        logging.error(f"Error in WebSocket: {e}\n{traceback.format_exc()}")
+    finally:
+        sessions.remove(connection_id)

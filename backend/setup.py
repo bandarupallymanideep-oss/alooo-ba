@@ -1,11 +1,11 @@
 from setuptools import find_packages, setup
 
 setup(
-    name='Nirikshan',
+    name='sadarakshak',
     version='0.1.0',
     author='Vishal Rajesh Mahajan',
     author_email='vism06@gmail.com',
-    description='Real Time Accident detection system using YOLOv11',
+    description='SADARAKSHAK - Real-Time Road Accident Detection and Monitoring System (YOLO11)',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
     url='https://github.com/VishalRMahajan/Nirikshan-AcciDetect',  
@@ -13,6 +13,8 @@ setup(
     install_requires=[
         'numpy',
         'opencv-python',
+        'supervision',
+        'av',
         'torch',
         'ultralytics',
         'fastapi',

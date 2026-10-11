@@ -1,0 +1,30 @@
+# ---- Python / backend
+__pycache__/
+*.py[cod]
+backend/venv/
+.venv/
+venv/
+
+# runtime data produced by SADARAKSHAK (accident footage, uploads, camera registry with RTSP URLs)
+backend/detected_accidents/
+backend/uploads/
+backend/data/
+backend/output_annotated.mp4
+backend/accident_images/*.jpg
+*.log
+
+# ---- Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+
+# ---- Local tooling / OS
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# OpenVINO export of best.pt (regenerated automatically at startup)
+backend/model/best_openvino_model/

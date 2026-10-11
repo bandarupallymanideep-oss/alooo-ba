@@ -39,7 +39,7 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s]: %(message)s:')
 Defining the project name and the list of files that need to be created for the project structure
 Add the files that need to be created in the list_of_files.
 """
-project_name = "Nirikshan"
+project_name = "sadarakshak"
 
 list_of_files = [
     ".github/workflows/.gitkeep",

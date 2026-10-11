@@ -1,6 +1,0 @@
-backend/
-backend/**
-*.py
-requirements.txt
-rtsp_loop.bat
-Dockerfile

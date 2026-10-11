@@ -1,0 +1,20 @@
+{
+  "name": "SADARAKSHAK - Road Accident Detection",
+  "short_name": "SADARAKSHAK",
+  "icons": [
+    {
+      "src": "/brand/sadarakshak-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/brand/sadarakshak-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "theme_color": "#0b1f4a",
+  "background_color": "#090d16",
+  "display": "standalone",
+  "start_url": "/"
+}

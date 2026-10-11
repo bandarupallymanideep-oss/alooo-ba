@@ -1,0 +1,243 @@
+@import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
+
+/* ==========================================================================
+   SADARAKSHAK theme system
+   Dark is the default. The light theme re-maps Tailwind's palette variables
+   (every slate, white and accent utility reads a --color variable), so all existing
+   components switch theme without per-component class changes.
+   `.force-dark` pins an area (video feeds, sidebar, login brand panel) to dark.
+   ========================================================================== */
+
+:root {
+  color-scheme: dark;
+  --app-bg: #090d16;
+  --app-bg-glow: rgba(239, 68, 68, 0.07);
+  --card-shadow: 0 10px 30px -12px rgba(0, 0, 0, 0.6);
+}
+
+html.light,
+.force-light {
+  color-scheme: light;
+  --app-bg: #f4f1ec;
+  --app-bg-glow: rgba(234, 88, 12, 0.06);
+  --card-shadow: 0 10px 30px -14px rgba(28, 25, 23, 0.18);
+
+  --color-slate-50: #12100e;
+  --color-slate-100: #1c1a17;
+  --color-slate-200: #292521;
+  --color-slate-300: #3d3833;
+  --color-slate-400: #57514b;
+  --color-slate-500: #7a7268;
+  --color-slate-600: #a39b8f;
+  --color-slate-700: #d6cfc4;
+  --color-slate-800: #e7e1d8;
+  --color-slate-900: #ffffff;
+  --color-slate-950: #f7f4ef;
+  --color-white: #171b26;
+
+  /* light accents need darker shades to stay readable on cream */
+  --color-red-200: #7f1d1d;
+  --color-red-300: #991b1b;
+  --color-red-400: #c2410c;
+  --color-amber-200: #78350f;
+  --color-amber-300: #92400e;
+  --color-amber-400: #b45309;
+  --color-emerald-200: #064e3b;
+  --color-emerald-300: #065f46;
+  --color-emerald-400: #047857;
+  --color-cyan-200: #164e63;
+  --color-cyan-300: #155e75;
+  --color-cyan-400: #0e7490;
+}
+
+/* Areas that always stay dark (video, sidebar, brand panels) */
+.force-dark {
+  color-scheme: dark;
+  --color-slate-50: oklch(98.4% 0.003 247.858);
+  --color-slate-100: oklch(96.8% 0.007 247.896);
+  --color-slate-200: oklch(92.9% 0.013 255.508);
+  --color-slate-300: oklch(86.9% 0.022 252.894);
+  --color-slate-400: oklch(70.4% 0.04 256.788);
+  --color-slate-500: oklch(55.4% 0.046 257.417);
+  --color-slate-600: oklch(44.6% 0.043 257.281);
+  --color-slate-700: oklch(37.2% 0.044 257.287);
+  --color-slate-800: oklch(27.9% 0.041 260.031);
+  --color-slate-900: oklch(20.8% 0.042 265.755);
+  --color-slate-950: oklch(12.9% 0.042 264.695);
+  --color-white: #fff;
+  --color-red-200: oklch(88.5% 0.062 18.334);
+  --color-red-300: oklch(80.8% 0.114 19.571);
+  --color-red-400: oklch(70.4% 0.191 22.216);
+  --color-amber-200: oklch(92.4% 0.12 95.746);
+  --color-amber-300: oklch(87.9% 0.169 91.605);
+  --color-amber-400: oklch(82.8% 0.189 84.429);
+  --color-emerald-200: oklch(90.5% 0.093 164.15);
+  --color-emerald-300: oklch(84.5% 0.143 164.978);
+  --color-emerald-400: oklch(76.5% 0.177 163.223);
+  --color-cyan-200: oklch(91.7% 0.08 205.041);
+  --color-cyan-300: oklch(86.5% 0.127 207.078);
+  --color-cyan-400: oklch(78.9% 0.154 211.53);
+}
+
+/* White text on saturated buttons / badges must stay white in the light theme */
+html.light .bg-red-600, html.light .bg-red-500, html.light .bg-red-700, html.light .bg-amber-600,
+html.light .bg-emerald-600, html.light .bg-cyan-600, html.light .on-accent, html.light [class*="from-red-6"],
+html.light [class*="bg-red-600\/"], html.light [class*="bg-red-500\/9"], html.light [class*="bg-red-500\/8"],
+.force-light .bg-red-600, .force-light .on-accent {
+  --color-white: #fff;
+}
+
+/* Smooth theme switching (class added for a moment by ThemeContext) */
+html.theme-switching *,
+html.theme-switching *::before,
+html.theme-switching *::after {
+  transition: background-color 0.35s ease, border-color 0.35s ease, color 0.35s ease, fill 0.35s ease !important;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--app-bg);
+  color: var(--color-slate-100);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  overflow-x: hidden;
+}
+
+.app-bg {
+  background-color: var(--app-bg);
+  background-image: radial-gradient(ellipse at top, var(--app-bg-glow), transparent 60%);
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-slate-950);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-slate-700);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-slate-600);
+}
+
+/* ------------------------------------------------------------------ cards */
+.card-shadow {
+  box-shadow: var(--card-shadow);
+}
+.card-elevate {
+  box-shadow: var(--card-shadow);
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.card-elevate:hover {
+  transform: translateY(-2px);
+}
+
+/* ------------------------------------------------------------------ animations */
+@keyframes page-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-page-in {
+  animation: page-in 0.28s ease-out both;
+}
+
+@keyframes modal-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.animate-modal-in {
+  animation: modal-in 0.2s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.animate-backdrop-in {
+  animation: backdrop-in 0.18s ease-out both;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(24px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.animate-bounce-short {
+  animation: toast-in 0.35s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes menu-in {
+  from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.animate-menu-in {
+  animation: menu-in 0.14s ease-out both;
+  transform-origin: top right;
+}
+
+@keyframes live-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55); }
+  70% { box-shadow: 0 0 0 7px rgba(239, 68, 68, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+.live-dot {
+  animation: live-pulse 1.8s ease-out infinite;
+}
+
+@keyframes radar-sweep {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.animate-radar {
+  animation: radar-sweep 14s linear infinite;
+}
+
+/* Radar ping animation */
+@keyframes radar-ping {
+  0% { transform: scale(0.9); opacity: 0.8; }
+  50% { transform: scale(1.4); opacity: 0.3; }
+  100% { transform: scale(1.8); opacity: 0; }
+}
+.animate-radar-ping {
+  animation: radar-ping 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+/* Accident alert flash */
+@keyframes accident-flash {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+    border-color: rgba(239, 68, 68, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 25px 4px rgba(239, 68, 68, 0.8);
+    border-color: rgba(239, 68, 68, 1);
+  }
+}
+.animate-accident-flash {
+  animation: accident-flash 1s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Scanline effect for video tiles */
+.scanlines {
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%),
+    linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Leaflet dark theme map tiles styling */
+html:not(.light) .dark-leaflet-map .leaflet-tile {
+  filter: brightness(0.65) invert(1) contrast(3) hue-rotate(200deg) saturate(0.3) brightness(0.7);
+}

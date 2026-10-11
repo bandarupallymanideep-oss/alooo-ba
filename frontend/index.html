@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="SADARAKSHAK - AI-powered real-time road accident detection and monitoring (YOLO11, CCTV/RTSP)" />
+    <meta name="theme-color" content="#090d16" />
+    <script>
+      // apply the saved SADARAKSHAK theme before first paint (no flash)
+      try {
+        var t = localStorage.getItem('sadarakshak_theme');
+        if (t === 'light') { document.documentElement.classList.remove('dark'); document.documentElement.classList.add('light'); }
+      } catch (e) {}
+    </script>
+    <title>SADARAKSHAK | Real-Time Road Accident Detection &amp; Monitoring</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  </head>
+  <body class="antialiased selection:bg-red-500/30">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
