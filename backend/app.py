@@ -12,6 +12,7 @@ backend decodes the stream with OpenCV and serves annotated frames as MJPEG.
 import asyncio
 import base64
 import json
+import os
 import re
 import time
 import traceback
@@ -131,9 +132,18 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title=f"{APP_NAME} API", description=APP_DESCRIPTION, lifespan=lifespan)
 
+DOWNLOADS_DIR = Path(os.environ.get("SADARAKSHAK_DOWNLOADS_DIR", BASE_DIR / "downloads"))
+try:
+    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
 app.mount("/accident_images", StaticFiles(directory=str(ACCIDENT_IMAGES_DIR)), name="accident_images")
 app.mount("/accident_clips", StaticFiles(directory=str(ACCIDENT_CLIPS_DIR)), name="accident_clips")
 app.mount("/detected_accidents", StaticFiles(directory=str(DETECTED_ACCIDENTS_DIR)), name="detected_accidents")
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
+if DOWNLOADS_DIR.exists():
+    app.mount("/downloads", StaticFiles(directory=str(DOWNLOADS_DIR)), name="downloads")
 
 # CORS: local Vite dev/preview servers on any port + configured production origins
 allowed_origins = [o.strip() for o in __import__("os").environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
@@ -147,27 +157,133 @@ app.add_middleware(
 )
 
 
-# ================================================================== health
+# ================================================================== health & diagnostics
+@app.get("/api/ping")
+async def ping():
+    return {"status": "ok", "app": APP_NAME, "version": "1.0.0"}
+
+
+def _get_engine_telemetry():
+    model = pipeline.model_trainer
+    active = [s for s in sessions.list() if s.is_active]
+
+    inference_ms_list = [s.inference_ms for s in active if s.inference_ms and s.inference_ms > 0]
+    inference_fps_list = [s.inference_fps for s in active if s.inference_fps and s.inference_fps > 0]
+
+    avg_inference_ms = round(sum(inference_ms_list) / len(inference_ms_list), 1) if inference_ms_list else None
+    avg_inference_fps = round(sum(inference_fps_list) / len(inference_fps_list), 1) if inference_fps_list else None
+
+    # Engine status
+    status = "READY"
+    if active:
+        status = "DETECTING"
+    hw_selection = getattr(model, "hardware_info", {}).get("selection", {})
+    if hw_selection.get("gpuStatus") == "WARNING_FALLBACK":
+        status = "WARNING"
+
+    return {
+        "modelName": getattr(model, "model_name", "YOLO11m"),
+        "device": getattr(model, "device_type", "CPU"),
+        "deviceDetailed": getattr(model, "device_label", "CPU"),
+        "accelerator": getattr(model, "accelerator", "CPU"),
+        "fps": avg_inference_fps,
+        "yoloLatencyMs": avg_inference_ms,
+        "warmupMs": round(getattr(model, "warmup_ms", 0.0), 1),
+        "activeJobs": len(active),
+        "status": status,
+        "isGpu": "cuda" in str(getattr(model, "device", "")).lower(),
+        "warning": hw_selection.get("warning"),
+        "hardware": getattr(model, "hardware_info", None),
+    }
+
+
 @app.get("/health")
 async def health_check():
     model = pipeline.model_trainer
     active = [s for s in sessions.list() if s.is_active]
+    engine_info = _get_engine_telemetry()
     return {
         "status": "ok",
         "app": APP_NAME,
         "model": {
+            "name": getattr(model, "model_name", "YOLO11m"),
             "path": str(MODEL_PATH.relative_to(BASE_DIR)) if MODEL_PATH.is_relative_to(BASE_DIR) else MODEL_PATH.name,
             "type": "YOLO11m (Ultralytics detect)",
-            "engine": model.engine,
-            "device": str(model.device),
-            "warmupInferenceMs": round(model.warmup_ms, 1),
-            "classes": model.class_names,
+            "engine": getattr(model, "engine", "pytorch"),
+            "device": str(getattr(model, "device", "cpu")),
+            "deviceType": getattr(model, "device_type", "CPU"),
+            "deviceLabel": getattr(model, "device_label", "CPU"),
+            "accelerator": getattr(model, "accelerator", "CPU"),
+            "warmupInferenceMs": round(getattr(model, "warmup_ms", 0.0), 1),
+            "classes": getattr(model, "class_names", {}),
             "accidentClassIds": sorted(ACCIDENT_CLASS_IDS),
             "confidenceThreshold": CONFIDENCE_THRESHOLD,
         },
+        "engine": engine_info,
         "activeSessions": len(active),
         "accidentsSaved": len(accident_store.list()),
         "detectedAccidentsDir": str(DETECTED_ACCIDENTS_DIR),
+    }
+
+
+@app.get("/api/system/engine")
+async def system_engine_endpoint():
+    return _get_engine_telemetry()
+
+
+@app.api_route("/api/system/detect-gpu", methods=["GET", "POST"])
+async def detect_gpu_endpoint():
+    from sadarakshak.components.hardware_detector import detect_gpu_status
+    await asyncio.sleep(0.3)
+    return await run_in_threadpool(detect_gpu_status, True)
+
+
+@app.get("/api/system/diagnostics")
+async def system_diagnostics_endpoint():
+    from sadarakshak.components.system_diagnostics import get_diagnostics
+    return await run_in_threadpool(get_diagnostics, pipeline.model_trainer, sessions)
+
+
+@app.get("/api/system/info")
+async def system_info_endpoint():
+    from sadarakshak.components.system_diagnostics import get_static_hardware
+    return await run_in_threadpool(get_static_hardware)
+
+
+@app.get("/api/downloads/info")
+async def downloads_info_endpoint():
+    """Information on downloadable desktop packages (installer, portable ZIP, scripts)."""
+    items = []
+    # Check both backend/downloads and desktop release directories
+    search_dirs = [DOWNLOADS_DIR, BASE_DIR.parent / "desktop" / "dist-release"]
+    for sdir in search_dirs:
+        if not sdir.exists():
+            continue
+        for f in sdir.glob("*.*"):
+            if f.suffix.lower() in {".exe", ".zip", ".msi"}:
+                size = f.stat().st_size
+                items.append({
+                    "filename": f.name,
+                    "type": "installer" if f.name.endswith(".exe") else "portable",
+                    "sizeBytes": size,
+                    "sizeMb": round(size / (1024 * 1024), 2),
+                    "url": f"/downloads/{f.name}",
+                    "updatedAt": datetime.fromtimestamp(f.stat().st_mtime).isoformat() + "Z"
+                })
+    return {
+        "version": "1.0.0",
+        "name": "SADARAKSHAK for Windows",
+        "supportedOs": "Windows 10 / Windows 11 (64-bit)",
+        "requirements": {
+            "os": "Windows 10 or 11 (64-bit)",
+            "cpu": "Intel Core i5 / AMD Ryzen 5 or higher",
+            "ram": "8 GB minimum (16 GB recommended)",
+            "gpu": "Optional: NVIDIA (CUDA) or Intel Arc / Iris Xe (OpenVINO AI acceleration)",
+            "storage": "2 GB free space"
+        },
+        "downloads": items,
+        "installerName": "SADARAKSHAK-Setup-x64.exe",
+        "portableName": "SADARAKSHAK-Windows-Portable.zip",
     }
 
 
@@ -387,6 +503,70 @@ async def camera_thumbnail(camera_id: str):
     return FileResponse(path, media_type="image/jpeg")
 
 
+# ================================================================== ONVIF Camera Discovery & Probing
+from sadarakshak.components.onvif_discovery import WSDiscoveryService, OnvifClient, test_onvif_stream
+
+
+class OnvifDiscoverRequest(BaseModel):
+    timeout: Optional[float] = 3.0
+
+
+class OnvifProbeRequest(BaseModel):
+    ip: str
+    port: Optional[int] = 80
+    username: Optional[str] = ""
+    password: Optional[str] = ""
+    timeout: Optional[float] = 6.0
+
+
+class OnvifStreamTestRequest(BaseModel):
+    streamUrl: str
+    timeout: Optional[float] = 6.0
+
+
+@app.post("/api/onvif/discover")
+async def discover_onvif_cameras(body: Optional[OnvifDiscoverRequest] = None):
+    """Scan local network using WS-Discovery UDP multicast on 239.255.255.250:3702."""
+    timeout = (body.timeout if body and body.timeout else 3.0)
+    svc = WSDiscoveryService(timeout=timeout)
+    cameras = await run_in_threadpool(svc.discover)
+    cams_list = [c.to_dict() for c in cameras]
+    msg = (
+        f"Discovered {len(cams_list)} ONVIF camera(s) on local reachable network."
+        if cams_list
+        else (
+            "No ONVIF cameras responded to discovery on your local network. Ensure cameras are powered on, "
+            "connected to the same subnet/Wi-Fi, and have ONVIF discovery enabled in their network settings."
+        )
+    )
+    return {"success": True, "cameras": cams_list, "count": len(cams_list), "message": msg}
+
+
+@app.post("/api/onvif/probe")
+async def probe_onvif_camera(body: OnvifProbeRequest):
+    """Query an ONVIF camera by IP:port to retrieve device metadata, profiles, and RTSP stream URIs."""
+    if not body.ip or not body.ip.strip():
+        return _err("INVALID_IP", "Camera IP address is required.")
+    client = OnvifClient(
+        host=body.ip.strip(),
+        port=body.port or 80,
+        username=body.username or "",
+        password=body.password or "",
+        timeout=body.timeout or 6.0,
+    )
+    result = await run_in_threadpool(client.probe)
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post("/api/onvif/test-stream")
+async def test_onvif_camera_stream(body: OnvifStreamTestRequest):
+    """Test video ingestion from a discovered ONVIF stream URI and capture a preview frame."""
+    if not body.streamUrl:
+        return _err("INVALID_URL", "Stream URL is required.")
+    result = await run_in_threadpool(test_onvif_stream, body.streamUrl)
+    return JSONResponse(status_code=200, content=result)
+
+
 # ================================================================== uploads
 async def _save_upload(file: UploadFile) -> Path:
     name = Path(file.filename or "video.mp4").name
@@ -536,6 +716,8 @@ class AccidentUpdate(BaseModel):
     status: Optional[str] = None
     notes: Optional[str] = None
     operatorName: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 
 @app.get("/api/accidents")
@@ -575,12 +757,81 @@ async def delete_accident(accident_id: str):
 @app.patch("/api/accidents/{accident_id}")
 async def update_accident(accident_id: str, body: AccidentUpdate):
     try:
-        rec = accident_store.update(accident_id, status=body.status, notes=body.notes, operator=body.operatorName)
+        rec = accident_store.update(accident_id, status=body.status, notes=body.notes,
+                                    operator=body.operatorName, latitude=body.latitude,
+                                    longitude=body.longitude)
     except ValueError as e:
         return _err("INVALID_STATUS", str(e))
     if rec is None:
         return _err("ACCIDENT_NOT_FOUND", f"Accident '{accident_id}' not found.", 404)
     return rec
+
+
+# ================================================================== map & GIS telemetry
+@app.get("/api/map/markers")
+async def get_map_markers():
+    """Consolidated CCTV camera and accident incident markers for the Location Map."""
+    markers = []
+    cams = [_public_camera(c) for c in camera_store.list()]
+    for cam in cams:
+        lat = cam.get("latitude")
+        lng = cam.get("longitude")
+        has_coords = lat is not None and lng is not None and not (isinstance(lat, float) and lat != lat)
+        cam_id = cam["id"] if cam["id"].startswith("cam-") else f"cam-{cam['id']}"
+        markers.append({
+            "id": cam_id,
+            "rawId": cam["id"],
+            "type": "camera",
+            "title": cam.get("name") or f"Camera {cam['id']}",
+            "subtitle": cam.get("location") or "CCTV Video Node",
+            "latitude": lat if has_coords else None,
+            "longitude": lng if has_coords else None,
+            "hasCoordinates": has_coords,
+            "status": cam.get("status") or "Offline",
+            "info": {
+                "sourceType": cam.get("sourceType"),
+                "resolution": cam.get("resolution"),
+                "fps": cam.get("fps"),
+                "autoStart": "Yes" if cam.get("autoStart") else "No",
+                "detectionState": (cam.get("detection") or {}).get("state") or ("Active" if cam.get("status") == "Processing" else "Idle"),
+                "updatedAt": cam.get("updatedAt") or cam.get("createdAt"),
+            }
+        })
+    accidents = accident_store.list()
+    for acc in accidents:
+        lat = acc.get("latitude")
+        lng = acc.get("longitude")
+        has_coords = lat is not None and lng is not None and not (isinstance(lat, float) and lat != lat)
+        acc_id = acc["id"] if acc["id"].startswith("incident-") else f"incident-{acc['id']}"
+        markers.append({
+            "id": acc_id,
+            "rawId": acc["id"],
+            "type": "incident",
+            "title": f"Incident {acc['id'].upper()}",
+            "subtitle": acc.get("categoryLabel") or acc.get("collisionType") or acc.get("location"),
+            "latitude": lat if has_coords else None,
+            "longitude": lng if has_coords else None,
+            "hasCoordinates": has_coords,
+            "status": acc.get("status") or "New",
+            "severity": acc.get("severity") or "Moderate",
+            "info": {
+                "collisionType": acc.get("collisionType"),
+                "confidenceScore": f"{acc.get('confidenceScore', 0):.1f}%" if acc.get("confidenceScore") is not None else "0%",
+                "vehiclesInvolved": acc.get("vehiclesInvolved"),
+                "timestamp": acc.get("timestamp"),
+                "cameraName": acc.get("cameraName"),
+                "location": acc.get("location"),
+            }
+        })
+    return {
+        "markers": markers,
+        "stats": {
+            "totalCameras": len(cams),
+            "mappedCameras": sum(1 for m in markers if m["type"] == "camera" and m["hasCoordinates"]),
+            "totalAccidents": len(accidents),
+            "mappedAccidents": sum(1 for m in markers if m["type"] == "incident" and m["hasCoordinates"]),
+        }
+    }
 
 
 # ================================================================== sample clips (backend/accident_clips)
@@ -721,3 +972,18 @@ async def accident_detection_websocket(websocket: WebSocket):
         logging.error(f"Error in WebSocket: {e}\n{traceback.format_exc()}")
     finally:
         sessions.remove(connection_id)
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+    import uvicorn
+
+    default_port = int(os.environ.get("PORT", "8000"))
+    parser = argparse.ArgumentParser(description="SADARAKSHAK Backend Server")
+    parser.add_argument("--host", default="127.0.0.1", help="Host address (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=default_port, help="Port number (default: 8000)")
+    args = parser.parse_args()
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+

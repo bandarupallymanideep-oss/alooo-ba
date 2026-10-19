@@ -1,0 +1,74 @@
+{
+  "name": "sadarakshak-desktop",
+  "version": "1.0.0",
+  "description": "SADARAKSHAK - Real-Time Road Accident Detection and Monitoring Windows Application",
+  "main": "main.js",
+  "author": "SADARAKSHAK Team",
+  "license": "MIT",
+  "scripts": {
+    "sync:frontend": "powershell -NoProfile -Command \"if (Test-Path '../frontend/dist') { New-Item -ItemType Directory -Force -Path 'frontend/dist'; Copy-Item -Recurse -Force '../frontend/dist/*' 'frontend/dist/'; if (Test-Path 'frontend/dist/downloads') { Remove-Item -Recurse -Force 'frontend/dist/downloads' } }\"",
+    "start": "npm run sync:frontend && electron .",
+    "pack": "npm run sync:frontend && electron-builder --dir",
+    "dist": "npm run sync:frontend && electron-builder --win --x64"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "^34.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.sadarakshak.app",
+    "productName": "SADARAKSHAK",
+    "directories": {
+      "output": "dist-release"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json",
+      "frontend/dist/**/*",
+      "!frontend/dist/downloads/**"
+    ],
+    "extraResources": [
+      {
+        "from": "../backend",
+        "to": "backend",
+        "filter": [
+          "app.py",
+          "requirements.txt",
+          "model/best.pt",
+          "model/best_openvino_model/**/*",
+          "sadarakshak/**/*",
+          "accident_clips/accident.mp4",
+          "tools/rtsp_test_server.py",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!venv/**",
+          "!output_annotated.mp4",
+          "!detected_accidents/**",
+          "!downloads/**"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "zip",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "SADARAKSHAK",
+      "artifactName": "SADARAKSHAK-Setup-x64.exe"
+    }
+  }
+}

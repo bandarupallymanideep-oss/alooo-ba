@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, Link } from 'react-router-dom';
 import { 
   ArrowLeft, 
   MapPin, 
@@ -14,7 +14,8 @@ import {
   Send,
   Loader2,
   Trash2,
-  Gauge
+  Gauge,
+  ExternalLink
 } from 'lucide-react';
 import { useAlerts } from '../context/AlertsContext';
 import { LeafletMap } from '../components/LeafletMap';
@@ -444,7 +445,14 @@ export const AlertDetail: React.FC = () => {
                   GEOGRAPHIC INCIDENT PINPOINT
                 </h3>
               </div>
-              <span className="text-[10px] font-mono text-slate-500">LEAFLET GIS</span>
+              <Link
+                to={`/map?id=${record.id}`}
+                className="text-[10px] font-mono text-blue-400 hover:text-blue-300 flex items-center gap-1 hover:underline"
+                title="View on full Location Map"
+              >
+                <span>OPEN COMMAND MAP</span>
+                <ExternalLink className="w-3 h-3" />
+              </Link>
             </div>
 
             {hasCoords ? (

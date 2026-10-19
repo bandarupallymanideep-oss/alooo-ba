@@ -1,14 +1,27 @@
-/**
- * Central HTTP client for the SADARAKSHAK FastAPI backend.
- * The backend location comes from VITE_BACKEND_URL (frontend/.env) - never hardcode it elsewhere.
- */
-export const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000').replace(/\/+$/, '');
+export function getBackendUrl(): string {
+  if (typeof window !== 'undefined') {
+    if ((window as any).electronAPI?.getBackendUrl) {
+      return (window as any).electronAPI.getBackendUrl();
+    }
+    if ((window as any).__SADARAKSHAK_BACKEND_URL__) {
+      return (window as any).__SADARAKSHAK_BACKEND_URL__;
+    }
+    // If running inside Electron or file:// protocol, default to local backend
+    if ((window as any).isElectron || window.location.protocol === 'file:') {
+      return 'http://127.0.0.1:8000';
+    }
+  }
+  return import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
+}
+
+export const BACKEND_URL = getBackendUrl().replace(/\/+$/, '');
 
 /** Turn a backend-relative path ("/detected_accidents/accident0.mp4") into an absolute URL. */
 export function backendUrl(path?: string | null): string {
   if (!path) return '';
   if (/^(https?:|data:|blob:)/i.test(path)) return path;
-  return `${BACKEND_URL}${path.startsWith('/') ? '' : '/'}${path}`;
+  const base = getBackendUrl().replace(/\/+$/, '');
+  return `${base}${path.startsWith('/') ? '' : '/'}${path}`;
 }
 
 export class ApiError extends Error {
@@ -27,7 +40,7 @@ export class ApiError extends Error {
 
 const unreachable = () =>
   new ApiError(
-    `Cannot reach the SADARAKSHAK backend at ${BACKEND_URL}. Make sure it is running (python -m uvicorn app:app --port 8000).`,
+    `Cannot reach the SADARAKSHAK backend at ${getBackendUrl()}. Make sure it is running (python -m uvicorn app:app --port 8000).`,
     'BACKEND_UNREACHABLE'
   );
 

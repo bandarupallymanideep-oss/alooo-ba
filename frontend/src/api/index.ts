@@ -6,3 +6,6 @@ export * from './eventEmitter';
 export * from './auth';
 export * from './cameras';
 export * from './alerts';
+export * from './system';
+export * from './map';
+export * from './onvif';

@@ -120,7 +120,8 @@ class AccidentStore:
         return records
 
     def update(self, accident_id: str, status: Optional[str] = None, notes: Optional[str] = None,
-               operator: Optional[str] = None) -> Optional[Dict]:
+               operator: Optional[str] = None, latitude: Optional[float] = None,
+               longitude: Optional[float] = None) -> Optional[Dict]:
         rec = self.get(accident_id)
         if rec is None:
             return None
@@ -137,6 +138,10 @@ class AccidentStore:
                 rec["resolvedBy"] = operator or "Operator"
         if notes is not None:
             rec["notes"] = notes[:5000]
+        if latitude is not None:
+            rec["latitude"] = latitude
+        if longitude is not None:
+            rec["longitude"] = longitude
         return self.save(rec)
 
 

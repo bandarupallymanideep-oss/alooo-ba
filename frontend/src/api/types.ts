@@ -1,6 +1,6 @@
 export type CameraStatus = 'Connected' | 'Offline' | 'Processing';
 
-export type SourceType = 'rtsp' | 'upload';
+export type SourceType = 'rtsp' | 'upload' | 'onvif';
 
 /** Backend detection session states */
 export type DetectionState =
@@ -173,21 +173,75 @@ export interface DashboardStats {
   resolvedToday: number;
 }
 
+export interface EngineTelemetry {
+  modelName: string;
+  device: string;
+  deviceDetailed: string;
+  accelerator: string;
+  fps: number | null;
+  yoloLatencyMs: number | null;
+  warmupMs: number;
+  activeJobs: number;
+  status: 'READY' | 'LOADING' | 'DETECTING' | 'WARNING';
+  isGpu: boolean;
+  warning?: string | null;
+  hardware?: {
+    cpu?: {
+      name: string;
+      logicalCores: number;
+      physicalCores: number;
+      architecture?: string;
+    };
+    primaryGpu?: {
+      name: string;
+      manufacturer?: string;
+      adapterRamBytes?: number;
+      adapterRamGb?: number | null;
+      driverVersion?: string;
+      status?: string;
+      memoryDisplay?: string;
+    };
+    cuda?: {
+      torchVersion?: string;
+      torchCudaSupported?: boolean;
+      isAvailable?: boolean;
+      isOperational?: boolean;
+      deviceCount?: number;
+      deviceName?: string | null;
+      failureReason?: string | null;
+    };
+    selection?: {
+      device?: string;
+      accelerator?: string;
+      deviceType?: string;
+      deviceLabel?: string;
+      gpuStatus?: string;
+      warning?: string | null;
+    };
+  };
+}
+
 export interface BackendHealth {
   status: string;
   app: string;
   model: {
+    name?: string;
     path: string;
     type: string;
     engine?: string;
     device: string;
+    deviceType?: string;
+    deviceLabel?: string;
+    accelerator?: string;
     warmupInferenceMs?: number;
     classes: Record<string, string>;
     accidentClassIds: number[];
     confidenceThreshold: number;
   };
+  engine?: EngineTelemetry;
   activeSessions: number;
   accidentsSaved: number;
+  detectedAccidentsDir?: string;
 }
 
 export interface AlertFilterOptions {
@@ -199,3 +253,51 @@ export interface AlertFilterOptions {
   search?: string;
   dateRange?: 'all' | 'today' | 'week' | 'month';
 }
+
+export interface DiscoveredCamera {
+  ip: string;
+  port: number;
+  xaddr: string;
+  endpoint_urn?: string;
+  name: string;
+  hardware?: string;
+  location?: string;
+  scopes?: string[];
+  types?: string;
+  onvif_supported: boolean;
+}
+
+export interface OnvifProfile {
+  token: string;
+  name: string;
+  width: number;
+  height: number;
+  resolution: string;
+  fps: number;
+  encoding: string;
+  streamUri: string;
+  maskedStreamUri: string;
+}
+
+export interface OnvifDeviceInfo {
+  manufacturer: string;
+  model: string;
+  firmware: string;
+  serial?: string;
+  hardware_id?: string;
+}
+
+export interface OnvifProbeResult {
+  success: boolean;
+  auth_required: boolean;
+  auth_valid: boolean;
+  message?: string;
+  device?: OnvifDeviceInfo;
+  profiles: OnvifProfile[];
+}
+
+export interface OnvifStreamTestResult extends ConnectionTestResult {
+  thumbnail?: string | null;
+  maskedUri?: string;
+}
+

@@ -41,7 +41,9 @@ export const TopBar: React.FC<TopBarProps> = ({ onToggleSidebar }) => {
   const getPageTitle = () => {
     if (location.pathname.startsWith('/dashboard')) return 'SADARAKSHAK Dashboard';
     if (location.pathname.startsWith('/live')) return 'Live Monitor & Accident Detection';
+    if (location.pathname.startsWith('/map')) return 'Location Map & GIS Network';
     if (location.pathname.startsWith('/alerts')) return 'Alerts & Accident Footage';
+    if (location.pathname.startsWith('/download')) return 'Download SADARAKSHAK for Windows';
     return 'SADARAKSHAK';
   };
 

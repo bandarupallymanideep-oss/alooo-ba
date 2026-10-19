@@ -11,7 +11,8 @@ import {
   RefreshCw,
   ArrowRight,
   Video,
-  Clock
+  Clock,
+  Radar
 } from 'lucide-react';
 import { useCameras } from '../context/CameraContext';
 import { useAlerts } from '../context/AlertsContext';
@@ -19,7 +20,7 @@ import { StatCard } from '../components/StatCard';
 import { CameraCard } from '../components/CameraCard';
 import { CameraModal } from '../components/CameraModal';
 import { VideoTile } from '../components/VideoTile';
-import type { Camera, CameraInput } from '../api/types';
+import type { Camera, CameraInput, SourceType } from '../api/types';
 import { BACKEND_URL } from '../api/client';
 
 function timeAgo(iso: string): string {
@@ -37,11 +38,19 @@ export const Dashboard: React.FC = () => {
 
   const [modalOpen, setModalOpen] = useState(false);
   const [selectedCameraForEdit, setSelectedCameraForEdit] = useState<Camera | null>(null);
+  const [modalInitialSource, setModalInitialSource] = useState<SourceType>('onvif');
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
 
+  const handleOpenDiscoverModal = () => {
+    setSelectedCameraForEdit(null);
+    setModalInitialSource('onvif');
+    setModalOpen(true);
+  };
+
   const handleOpenAddModal = () => {
     setSelectedCameraForEdit(null);
+    setModalInitialSource('rtsp');
     setModalOpen(true);
   };
 
@@ -102,6 +111,15 @@ export const Dashboard: React.FC = () => {
             title="Refresh"
           >
             <RefreshCw className="w-4 h-4" />
+          </button>
+          <button
+            type="button"
+            onClick={handleOpenDiscoverModal}
+            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white text-xs font-bold tracking-wide shadow-lg shadow-cyan-600/25 transition-all cursor-pointer active:scale-95"
+            title="Scan network for ONVIF IP cameras"
+          >
+            <Radar className="w-4 h-4" />
+            <span>Discover Cameras</span>
           </button>
           <button
             type="button"
@@ -281,6 +299,15 @@ export const Dashboard: React.FC = () => {
                 <option value="offline">Offline ({totalCameras - onlineCameras})</option>
               </select>
             </div>
+            <button
+              type="button"
+              onClick={handleOpenDiscoverModal}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-950 border border-cyan-500/40 text-cyan-400 hover:bg-cyan-500/10 text-xs font-mono font-semibold transition-all cursor-pointer"
+              title="Discover ONVIF cameras on reachable network"
+            >
+              <Radar className="w-3.5 h-3.5" />
+              <span className="hidden md:inline">Discover</span>
+            </button>
           </div>
         </div>
 
@@ -297,16 +324,26 @@ export const Dashboard: React.FC = () => {
             <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto mb-4">
               {searchQuery || statusFilter !== 'all'
                 ? 'No cameras match your search and filter.'
-                : 'Add your first CCTV / IP camera (RTSP) or an accident video.'}
+                : 'Discover your IP CCTV cameras via ONVIF, or enter an RTSP URL or video file.'}
             </p>
-            <button
-              type="button"
-              onClick={handleOpenAddModal}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-semibold shadow-md transition-colors cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-              <span>Add Camera</span>
-            </button>
+            <div className="flex items-center justify-center gap-3">
+              <button
+                type="button"
+                onClick={handleOpenDiscoverModal}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold shadow-md transition-colors cursor-pointer"
+              >
+                <Radar className="w-4 h-4" />
+                <span>Discover Cameras</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleOpenAddModal}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition-colors cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                <span>Add Manually</span>
+              </button>
+            </div>
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
@@ -323,6 +360,7 @@ export const Dashboard: React.FC = () => {
         onSave={handleSaveCamera}
         cameraToEdit={selectedCameraForEdit}
         totalCamerasCount={cameras.length}
+        initialSourceType={modalInitialSource}
       />
     </div>
   );

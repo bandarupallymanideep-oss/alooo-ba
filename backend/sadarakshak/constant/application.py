@@ -28,14 +28,17 @@ APP_DESCRIPTION = "Real-Time Road Accident Detection and Monitoring System"
 # ---------------------------------------------------------------- paths
 BASE_DIR = Path(__file__).resolve().parent.parent.parent  # backend/
 MODEL_PATH = Path(os.environ.get("SADARAKSHAK_MODEL_PATH", BASE_DIR / "model" / "best.pt"))
-ACCIDENT_CLIPS_DIR = BASE_DIR / "accident_clips"          # original test videos (read-only)
-DETECTED_ACCIDENTS_DIR = BASE_DIR / "detected_accidents"  # generated accidentN.mp4 / .jpg / .json
-ACCIDENT_IMAGES_DIR = BASE_DIR / "accident_images"        # legacy snapshot folder
-UPLOADS_DIR = BASE_DIR / "uploads"                        # user-uploaded videos
-DATA_DIR = BASE_DIR / "data"                              # camera registry + thumbnails
+ACCIDENT_CLIPS_DIR = Path(os.environ.get("SADARAKSHAK_ACCIDENT_CLIPS_DIR", BASE_DIR / "accident_clips"))
+DETECTED_ACCIDENTS_DIR = Path(os.environ.get("SADARAKSHAK_DETECTED_ACCIDENTS_DIR", BASE_DIR / "detected_accidents"))
+ACCIDENT_IMAGES_DIR = Path(os.environ.get("SADARAKSHAK_ACCIDENT_IMAGES_DIR", BASE_DIR / "accident_images"))
+UPLOADS_DIR = Path(os.environ.get("SADARAKSHAK_UPLOADS_DIR", BASE_DIR / "uploads"))
+DATA_DIR = Path(os.environ.get("SADARAKSHAK_DATA_DIR", BASE_DIR / "data"))
 
 for _d in (ACCIDENT_CLIPS_DIR, DETECTED_ACCIDENTS_DIR, ACCIDENT_IMAGES_DIR, UPLOADS_DIR, DATA_DIR):
-    _d.mkdir(parents=True, exist_ok=True)
+    try:
+        _d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 

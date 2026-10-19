@@ -43,8 +43,14 @@ export const CameraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     if (inFlight.current) return;
     inFlight.current = true;
     try {
-      const data = await getCameras();
+      const [data, healthData] = await Promise.all([
+        getCameras(),
+        getHealth().catch(() => null),
+      ]);
       setCameras(data);
+      if (healthData) {
+        setHealth(healthData);
+      }
       setError(null);
       setBackendOnline(true);
     } catch (err: any) {
@@ -61,11 +67,6 @@ export const CameraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     const timer = setInterval(refreshCameras, POLL_MS);
     return () => clearInterval(timer);
   }, [refreshCameras]);
-
-  useEffect(() => {
-    if (!backendOnline) return;
-    getHealth().then(setHealth).catch(() => setHealth(null));
-  }, [backendOnline]);
 
   const upsert = (cam: Camera) =>
     setCameras(prev => (prev.some(c => c.id === cam.id) ? prev.map(c => (c.id === cam.id ? cam : c)) : [...prev, cam]));

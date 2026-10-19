@@ -28,3 +28,13 @@ Thumbs.db
 
 # OpenVINO export of best.pt (regenerated automatically at startup)
 backend/model/best_openvino_model/
+
+# ---- Desktop & Build Releases
+desktop/node_modules/
+desktop/dist-release/
+desktop/frontend/
+backend/downloads/
+frontend/public/downloads/
+scratch/
+nirikshan_map_extracted/
+

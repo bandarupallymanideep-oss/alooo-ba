@@ -45,10 +45,11 @@ export const LeafletMap: React.FC<LeafletMapProps> = ({
         attributionControl: false
       });
 
-      // Dark Matter tile layer (CartoDB) with fallback
-      L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      // OpenStreetMap tile layer (no API key required)
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         maxZoom: 19,
-        subdomains: 'abcd'
+        subdomains: 'abc',
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
       }).addTo(map);
 
       mapInstanceRef.current = map;

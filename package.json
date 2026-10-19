@@ -1,0 +1,27 @@
+{
+  "name": "sadarakshak",
+  "version": "1.0.0",
+  "description": "SADARAKSHAK - Real-Time Road Accident Detection & Monitoring System (Web + Windows Desktop)",
+  "scripts": {
+    "dev:frontend": "npm --prefix frontend run dev",
+    "dev:backend": "cd backend && venv\\Scripts\\python.exe -m uvicorn app:app --reload --port 8000",
+    "dev": "npm --prefix frontend run dev",
+    "build:frontend": "npm --prefix frontend run build",
+    "build": "npm --prefix frontend run build",
+    "desktop": "npm --prefix desktop run start",
+    "desktop:dist": "npm --prefix desktop run dist",
+    "dist": "npm run build:frontend && npm --prefix desktop run dist",
+    "test:backend": "cd backend && venv\\Scripts\\python.exe run_backend_test.py --max-frames 150"
+  },
+  "keywords": [
+    "accident-detection",
+    "yolo11",
+    "rtsp",
+    "cctv",
+    "road-safety",
+    "electron",
+    "fastapi"
+  ],
+  "author": "SADARAKSHAK Team",
+  "license": "MIT"
+}
